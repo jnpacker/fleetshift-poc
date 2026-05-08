@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -20,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"buf.build/go/protovalidate"
 	wfbackend "github.com/cschleiden/go-workflows/backend"
 	wfpostgres "github.com/cschleiden/go-workflows/backend/postgres"
 	wfsqlite "github.com/cschleiden/go-workflows/backend/sqlite"
@@ -32,9 +32,9 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/reflection"
 
 	pb "github.com/fleetshift/fleetshift-poc/fleetshift-server/gen/fleetshift/v1"
+	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/clustermgmt"
 	kindaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/kind"
 	kubernetesaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/kubernetes"
 	ocpaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/ocp"
@@ -50,6 +50,7 @@ import (
 	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/infrastructure/sqlite"
 	transportgrpc "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/transport/grpc"
 	transporthttp "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/transport/http"
+	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/transport/managedresource"
 )
 
 type serveFlags struct {
@@ -89,7 +90,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.webDir, "web-dir", "", "directory containing frontend assets to serve (empty = API only)")
 	cmd.Flags().StringVar(&f.oidcUIAuthority, "oidc-ui-authority", os.Getenv("OIDC_ISSUER_URL"), "OIDC authority URL for the frontend UI")
 	cmd.Flags().StringVar(&f.oidcUIClientID, "oidc-ui-client-id", envOrDefault("OIDC_UI_CLIENT_ID", "fleetshift-ui"), "OIDC client ID for the frontend UI")
-	cmd.Flags().StringVar(&f.addons, "addons", "kind,ocp,kubernetes", "comma-separated list of addons to enable (default: all)")
+	cmd.Flags().StringVar(&f.addons, "addons", "kind,ocp,kubernetes,cluster-mgmt", "comma-separated list of addons to enable (default: all)")
 	return cmd
 }
 
@@ -134,6 +135,11 @@ func runServe(ctx context.Context, f *serveFlags) error {
 	}
 	defer db.Close()
 
+	specValidator, err := protovalidate.New()
+	if err != nil {
+		return fmt.Errorf("create spec validator: %w", err)
+	}
+
 	router := delivery.NewRoutingDeliveryService()
 
 	logger, err := buildLogger(f.logLevel, f.logFormat, f.logLevelOverride)
@@ -153,6 +159,14 @@ func runServe(ctx context.Context, f *serveFlags) error {
 	enabledAddons := parseAddons(f.addons)
 	logger.Info("enabled addons", "addons", slices.Sorted(maps.Keys(enabledAddons)))
 
+	// --- construct addon agents ---
+	//
+	// Agent construction stays here because agents have external
+	// dependencies (Docker, AWS creds, etc.) that the addon manager
+	// should not own. Registration with the router and targets happens
+	// later via AddonManager.Connect / RegisterTarget.
+
+	var kindAgent domain.DeliveryAgent
 	if enabledAddons["kind"] {
 		kindOpts := []kindaddon.AgentOption{
 			kindaddon.WithObserver(kindaddon.NewSlogAgentObserver(logger)),
@@ -172,7 +186,7 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			kindOpts = append(kindOpts, kindaddon.WithOIDCHTTPSPort(httpsPort))
 			logger.Info("kind agent: upgrading HTTP OIDC issuer URLs to HTTPS on port " + httpsPort)
 		}
-		kindAgent := kindaddon.NewAgent(
+		kindAgent = kindaddon.NewAgent(
 			func(logger kindlog.Logger) kindaddon.ClusterProvider {
 				var opts []cluster.ProviderOption
 				if logger != nil {
@@ -182,24 +196,20 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			},
 			kindOpts...,
 		)
-		router.Register(kindaddon.TargetType, kindAgent)
 	}
 
-	// --- OCP agent ---
-	ocpAgent := ocpaddon.NewAgent(
-		ocpaddon.WithVault(vault),
-		ocpaddon.WithObserver(ocpaddon.NewSlogAgentObserver(logger)),
-	)
-	if err := ocpAgent.Start(); err != nil {
-		return fmt.Errorf("start ocp agent: %w", err)
+	var ocpAgent *ocpaddon.Agent
+	if enabledAddons["ocp"] {
+		ocpAgent = ocpaddon.NewAgent(
+			ocpaddon.WithVault(vault),
+			ocpaddon.WithObserver(ocpaddon.NewSlogAgentObserver(logger)),
+		)
+		if err := ocpAgent.Start(); err != nil {
+			return fmt.Errorf("start ocp agent: %w", err)
+		}
+		defer ocpAgent.Shutdown(ctx)
+		logger.Info("OCP addon callback server listening", "addr", ocpAgent.CallbackAddr())
 	}
-	defer ocpAgent.Shutdown(ctx)
-	logger.Info("OCP addon callback server listening", "addr", ocpAgent.CallbackAddr())
-
-	router.Register(ocpaddon.TargetType, ocpAgent)
-
-	// Kubernetes agent is registered after the attestation verifier is
-	// built (see below). The router is only consulted at delivery time.
 
 	var wfBackend wfbackend.Backend
 	if f.databaseURL != "" {
@@ -265,27 +275,33 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		return fmt.Errorf("register delete-deployment: %w", err)
 	}
 
-	// --- seed default targets ---
+	// --- managed resource workflows ---
 
-	targetSvc := &application.TargetService{Store: store}
-	if enabledAddons["kind"] {
-		if err := targetSvc.Register(ctx, domain.TargetInfo{
-			ID:                    "kind-local",
-			Type:                  kindaddon.TargetType,
-			Name:                  "Local Kind Provider",
-			AcceptedResourceTypes: []domain.ResourceType{kindaddon.ClusterResourceType, domain.TrustBundleResourceType},
-		}); err != nil && !errors.Is(err, domain.ErrAlreadyExists) {
-			return fmt.Errorf("seed kind target: %w", err)
-		}
+	createMRSpec := &domain.CreateManagedResourceWorkflowSpec{
+		Store:         store,
+		Orchestration: orchWf,
+	}
+	createMRWf, err := reg.RegisterCreateManagedResource(createMRSpec)
+	if err != nil {
+		return fmt.Errorf("register create-managed-resource: %w", err)
 	}
 
-	if err := targetSvc.Register(ctx, domain.TargetInfo{
-		ID:                    "ocp-aws",
-		Type:                  ocpaddon.TargetType,
-		Name:                  "OCP on AWS",
-		AcceptedResourceTypes: []domain.ResourceType{ocpaddon.ClusterResourceType},
-	}); err != nil && !errors.Is(err, domain.ErrAlreadyExists) {
-		return fmt.Errorf("seed ocp-aws target: %w", err)
+	mrCleanupSpec := &domain.DeleteManagedResourceCleanupWorkflowSpec{
+		Store: store,
+	}
+	mrCleanupWf, err := reg.RegisterDeleteManagedResourceCleanup(mrCleanupSpec)
+	if err != nil {
+		return fmt.Errorf("register delete-managed-resource-cleanup: %w", err)
+	}
+
+	deleteMRSpec := &domain.DeleteManagedResourceWorkflowSpec{
+		Store:         store,
+		Orchestration: orchWf,
+		Cleanup:       mrCleanupWf,
+	}
+	deleteMRWf, err := reg.RegisterDeleteManagedResource(deleteMRSpec)
+	if err != nil {
+		return fmt.Errorf("register delete-managed-resource: %w", err)
 	}
 
 	workerCtx, workerCancel := context.WithCancel(ctx)
@@ -393,23 +409,35 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		AuthMethods: authMethodRepo,
 	}
 
+	managedResourceSvc := &application.ManagedResourceService{
+		Store:             store,
+		CreateWF:          createMRWf,
+		DeleteWF:          deleteMRWf,
+		ProvenanceBuilder: provenanceBuilder,
+	}
+
 	// --- kubernetes delivery agent ---
 
-	kubeAgentOpts := []kubernetesaddon.AgentOption{
-		kubernetesaddon.WithKeyResolver(keyResolver),
-		kubernetesaddon.WithVault(vault),
+	var kubeAgent domain.DeliveryAgent
+	if enabledAddons["kubernetes"] {
+		kubeAgentOpts := []kubernetesaddon.AgentOption{
+			kubernetesaddon.WithKeyResolver(keyResolver),
+			kubernetesaddon.WithVault(vault),
+		}
+		if oidcHTTPClient != nil {
+			kubeAgentOpts = append(kubeAgentOpts, kubernetesaddon.WithHTTPClient(oidcHTTPClient))
+		}
+		kubeAgent = kubernetesaddon.NewAgent(kubeAgentOpts...)
 	}
-	if oidcHTTPClient != nil {
-		kubeAgentOpts = append(kubeAgentOpts, kubernetesaddon.WithHTTPClient(oidcHTTPClient))
-	}
-	kubeAgent := kubernetesaddon.NewAgent(kubeAgentOpts...)
-	router.Register(kubernetesaddon.TargetType, kubeAgent)
 
-	// --- gRPC server ---
+	// --- dynamic service infrastructure ---
+
+	dynamicMux := managedresource.NewDynamicServiceMux()
 
 	grpcServer := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(authnInterceptor.Unary()),
 		grpc.ChainStreamInterceptor(authnInterceptor.Stream()),
+		grpc.UnknownServiceHandler(dynamicMux.Handle),
 	)
 	pb.RegisterDeploymentServiceServer(grpcServer, &transportgrpc.DeploymentServer{
 		Deployments: deploymentSvc,
@@ -421,7 +449,7 @@ func runServe(ctx context.Context, f *serveFlags) error {
 	pb.RegisterSignerEnrollmentServiceServer(grpcServer, &transportgrpc.SignerEnrollmentServer{
 		Enrollments: signerEnrollmentSvc,
 	})
-	reflection.Register(grpcServer)
+	managedresource.RegisterCompositeReflection(grpcServer, dynamicMux)
 
 	grpcLis, err := net.Listen("tcp", f.grpcAddr)
 	if err != nil {
@@ -442,8 +470,13 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		return fmt.Errorf("register signer enrollment gateway: %w", err)
 	}
 
+	// Dynamic managed resource HTTP routes are registered directly on
+	// topMux by the SchemaActivator. Go 1.22+ ServeMux uses
+	// longest-prefix matching, so explicit paths like /v1/clusters
+	// always take precedence over the gateway's /v1/ catch-all.
 	topMux := http.NewServeMux()
 	topMux.Handle("/v1/", gwMux)
+	dynamicHTTPMux := managedresource.NewDynamicHTTPMux(topMux)
 
 	if f.webDir != "" {
 		uiMux := transporthttp.NewUIConfigMux(transporthttp.UIConfigOptions{
@@ -462,6 +495,46 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		Handler: topMux,
 	}
 
+	// --- addon lifecycle ---
+
+	typeSvc := &application.ManagedResourceTypeService{Store: store}
+	activator := &managedresource.DynamicSchemaActivator{
+		GRPCMux:  dynamicMux,
+		HTTPMux:  dynamicHTTPMux,
+		GRPCAddr: f.grpcAddr,
+		Deps: managedresource.Deps{
+			Resources: managedResourceSvc,
+			Validator: specValidator,
+		},
+	}
+	addonMgr := application.NewAddonManager(application.AddonManagerDeps{
+		Router:    router,
+		TypeSvc:   typeSvc,
+		Activator: activator,
+	})
+
+	// Phase 2: enable addons — records capabilities, no API surface yet.
+	if enabledAddons["kind"] {
+		if err := addonMgr.Enable(ctx, kindaddon.Descriptor()); err != nil {
+			return fmt.Errorf("enable kind addon: %w", err)
+		}
+	}
+	if enabledAddons["ocp"] {
+		if err := addonMgr.Enable(ctx, ocpaddon.Descriptor()); err != nil {
+			return fmt.Errorf("enable ocp addon: %w", err)
+		}
+	}
+	if enabledAddons["kubernetes"] {
+		if err := addonMgr.Enable(ctx, kubernetesaddon.Descriptor()); err != nil {
+			return fmt.Errorf("enable kubernetes addon: %w", err)
+		}
+	}
+	if enabledAddons["cluster-mgmt"] {
+		if err := addonMgr.Enable(ctx, clustermgmt.Descriptor()); err != nil {
+			return fmt.Errorf("enable cluster-mgmt addon: %w", err)
+		}
+	}
+
 	// --- start ---
 
 	errCh := make(chan error, 2)
@@ -477,6 +550,53 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			errCh <- err
 		}
 	}()
+
+	// Phase 3: connect addons — schemas compiled, delivery agents
+	// registered, targets seeded. Happens AFTER the servers are serving
+	// so the DynamicServiceMux can dispatch immediately.
+	if enabledAddons["kind"] {
+		if err := addonMgr.Connect(ctx, "kind", application.ConnectInput{
+			Agent: kindAgent,
+			Targets: []domain.TargetInfo{{
+				ID:                    "kind-local",
+				Type:                  kindaddon.TargetType,
+				Name:                  "Local Kind Provider",
+				AcceptedResourceTypes: []domain.ResourceType{kindaddon.ClusterResourceType, domain.TrustBundleResourceType},
+			}},
+		}); err != nil {
+			return fmt.Errorf("connect kind addon: %w", err)
+		}
+	}
+
+	if enabledAddons["ocp"] {
+		if err := addonMgr.Connect(ctx, "ocp", application.ConnectInput{
+			Agent: ocpAgent,
+			Targets: []domain.TargetInfo{{
+				ID:                    "ocp-aws",
+				Type:                  ocpaddon.TargetType,
+				Name:                  "OCP on AWS",
+				AcceptedResourceTypes: []domain.ResourceType{ocpaddon.ClusterResourceType},
+			}},
+		}); err != nil {
+			return fmt.Errorf("connect ocp addon: %w", err)
+		}
+	}
+
+	if enabledAddons["kubernetes"] {
+		if err := addonMgr.Connect(ctx, "kubernetes", application.ConnectInput{
+			Agent: kubeAgent,
+		}); err != nil {
+			return fmt.Errorf("connect kubernetes addon: %w", err)
+		}
+	}
+
+	if enabledAddons["cluster-mgmt"] {
+		if err := addonMgr.Connect(ctx, "cluster-mgmt", application.ConnectInput{
+			Schemas: []domain.ManagedResourceSchema{clustermgmt.Schema()},
+		}); err != nil {
+			return fmt.Errorf("connect cluster-mgmt addon: %w", err)
+		}
+	}
 
 	// --- shutdown ---
 
