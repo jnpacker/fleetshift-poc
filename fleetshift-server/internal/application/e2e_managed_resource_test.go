@@ -242,6 +242,10 @@ func TestEndToEnd_ManagedResource_DeliveryWithAttestation(t *testing.T) {
 		t.Errorf("DeliveryAuth.Token = %q, want %q", deliveredAuth.Token, "access-token")
 	}
 
+	if gen := agent.capturedGeneration(); gen != 3 {
+		t.Errorf("Generation = %d, want 3", gen)
+	}
+
 	// --- Step 6: Verify the resource is retrievable from the service ---
 	got, err := resourceSvc.Get(ctx, "clusters", "prod-us-east-1")
 	if err != nil {
@@ -278,24 +282,26 @@ func awaitFulfillmentState(ctx context.Context, t *testing.T, store domain.Store
 // mrCapturingDeliveryAgent wraps another delivery service and captures
 // the last attestation, manifests, and auth delivered.
 type mrCapturingDeliveryAgent struct {
-	inner     domain.DeliveryService
-	mu        sync.Mutex
-	att       *domain.Attestation
-	manifests []domain.Manifest
-	auth      domain.DeliveryAuth
+	inner      domain.DeliveryService
+	mu         sync.Mutex
+	att        *domain.Attestation
+	manifests  []domain.Manifest
+	auth       domain.DeliveryAuth
+	generation domain.Generation
 }
 
-func (a *mrCapturingDeliveryAgent) Deliver(ctx context.Context, target domain.TargetInfo, id domain.DeliveryID, manifests []domain.Manifest, auth domain.DeliveryAuth, att *domain.Attestation) error {
+func (a *mrCapturingDeliveryAgent) Deliver(ctx context.Context, target domain.TargetInfo, id domain.DeliveryID, manifests []domain.Manifest, auth domain.DeliveryAuth, att *domain.Attestation, generation domain.Generation) error {
 	a.mu.Lock()
 	a.att = att
 	a.manifests = manifests
 	a.auth = auth
+	a.generation = generation
 	a.mu.Unlock()
-	return a.inner.Deliver(ctx, target, id, manifests, auth, att)
+	return a.inner.Deliver(ctx, target, id, manifests, auth, att, generation)
 }
 
-func (a *mrCapturingDeliveryAgent) Remove(ctx context.Context, target domain.TargetInfo, id domain.DeliveryID, manifests []domain.Manifest, auth domain.DeliveryAuth, att *domain.Attestation) error {
-	return a.inner.Remove(ctx, target, id, manifests, auth, att)
+func (a *mrCapturingDeliveryAgent) Remove(ctx context.Context, target domain.TargetInfo, id domain.DeliveryID, manifests []domain.Manifest, auth domain.DeliveryAuth, att *domain.Attestation, generation domain.Generation) error {
+	return a.inner.Remove(ctx, target, id, manifests, auth, att, generation)
 }
 
 func (a *mrCapturingDeliveryAgent) capturedAttestation() *domain.Attestation {
@@ -314,6 +320,12 @@ func (a *mrCapturingDeliveryAgent) capturedAuth() domain.DeliveryAuth {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.auth
+}
+
+func (a *mrCapturingDeliveryAgent) capturedGeneration() domain.Generation {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.generation
 }
 
 func signManagedResourceEnvelope(

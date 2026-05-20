@@ -15,17 +15,18 @@ type spyAgent struct {
 	removed   []domain.RemoveInput
 }
 
-func (s *spyAgent) Deliver(_ context.Context, target domain.TargetInfo, deliveryID domain.DeliveryID, manifests []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation) error {
+func (s *spyAgent) Deliver(_ context.Context, target domain.TargetInfo, deliveryID domain.DeliveryID, manifests []domain.Manifest, _ domain.DeliveryAuth, _ *domain.Attestation, generation domain.Generation) error {
 	s.delivered = append(s.delivered, domain.DeliverInput{
 		Target:        target,
 		DeliveryID:    deliveryID,
 		FulfillmentID: domain.FulfillmentID(deliveryID),
 		Manifests:     manifests,
+		Generation:    generation,
 	})
 	return nil
 }
 
-func (s *spyAgent) Remove(_ context.Context, target domain.TargetInfo, deliveryID domain.DeliveryID, manifests []domain.Manifest, auth domain.DeliveryAuth, att *domain.Attestation) error {
+func (s *spyAgent) Remove(_ context.Context, target domain.TargetInfo, deliveryID domain.DeliveryID, manifests []domain.Manifest, auth domain.DeliveryAuth, att *domain.Attestation, generation domain.Generation) error {
 	s.removed = append(s.removed, domain.RemoveInput{
 		Target:        target,
 		DeliveryID:    deliveryID,
@@ -33,6 +34,7 @@ func (s *spyAgent) Remove(_ context.Context, target domain.TargetInfo, deliveryI
 		Manifests:     manifests,
 		Auth:          auth,
 		Attestation:   att,
+		Generation:    generation,
 	})
 	return nil
 }
@@ -51,10 +53,10 @@ func TestRoutingDeliveryService_RoutesToCorrectAgent(t *testing.T) {
 
 	manifests := []domain.Manifest{{Raw: json.RawMessage(`{}`)}}
 
-	if err := router.Deliver(ctx, kindTarget, "d1:k1", manifests, domain.DeliveryAuth{}, nil); err != nil {
+	if err := router.Deliver(ctx, kindTarget, "d1:k1", manifests, domain.DeliveryAuth{}, nil, 1); err != nil {
 		t.Fatalf("Deliver to kind: %v", err)
 	}
-	if err := router.Deliver(ctx, k8sTarget, "d2:c1", manifests, domain.DeliveryAuth{}, nil); err != nil {
+	if err := router.Deliver(ctx, k8sTarget, "d2:c1", manifests, domain.DeliveryAuth{}, nil, 1); err != nil {
 		t.Fatalf("Deliver to kubernetes: %v", err)
 	}
 
@@ -64,12 +66,18 @@ func TestRoutingDeliveryService_RoutesToCorrectAgent(t *testing.T) {
 	if kindAgent.delivered[0].DeliveryID != "d1:k1" {
 		t.Errorf("kindAgent: DeliveryID = %q, want %q", kindAgent.delivered[0].DeliveryID, "d1:k1")
 	}
+	if kindAgent.delivered[0].Generation != 1 {
+		t.Errorf("kindAgent: Generation = %d, want 1", kindAgent.delivered[0].Generation)
+	}
 
 	if len(k8sAgent.delivered) != 1 {
 		t.Fatalf("k8sAgent: got %d deliveries, want 1", len(k8sAgent.delivered))
 	}
 	if k8sAgent.delivered[0].DeliveryID != "d2:c1" {
 		t.Errorf("k8sAgent: DeliveryID = %q, want %q", k8sAgent.delivered[0].DeliveryID, "d2:c1")
+	}
+	if k8sAgent.delivered[0].Generation != 1 {
+		t.Errorf("k8sAgent: Generation = %d, want 1", k8sAgent.delivered[0].Generation)
 	}
 }
 
@@ -82,7 +90,7 @@ func TestRoutingDeliveryService_RemoveRoutesToCorrectAgent(t *testing.T) {
 	ctx := context.Background()
 	target := domain.TargetInfo{ID: "k1", Type: "kind", Name: "local-kind"}
 
-	if err := router.Remove(ctx, target, "d1:k1", nil, domain.DeliveryAuth{}, nil); err != nil {
+	if err := router.Remove(ctx, target, "d1:k1", nil, domain.DeliveryAuth{}, nil, 1); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
 
@@ -92,6 +100,9 @@ func TestRoutingDeliveryService_RemoveRoutesToCorrectAgent(t *testing.T) {
 	if agent.removed[0].DeliveryID != "d1:k1" {
 		t.Errorf("DeliveryID = %q, want %q", agent.removed[0].DeliveryID, "d1:k1")
 	}
+	if agent.removed[0].Generation != 1 {
+		t.Errorf("Generation = %d, want 1", agent.removed[0].Generation)
+	}
 }
 
 func TestRoutingDeliveryService_UnregisteredTypeReturnsError(t *testing.T) {
@@ -100,7 +111,7 @@ func TestRoutingDeliveryService_UnregisteredTypeReturnsError(t *testing.T) {
 	ctx := context.Background()
 	target := domain.TargetInfo{ID: "k1", Type: "unknown", Name: "target"}
 
-	err := router.Deliver(ctx, target, "d1:k1", nil, domain.DeliveryAuth{}, nil)
+	err := router.Deliver(ctx, target, "d1:k1", nil, domain.DeliveryAuth{}, nil, 1)
 	if err == nil {
 		t.Fatal("expected error for unregistered target type")
 	}
@@ -108,7 +119,7 @@ func TestRoutingDeliveryService_UnregisteredTypeReturnsError(t *testing.T) {
 		t.Errorf("expected ErrInvalidArgument, got: %v", err)
 	}
 
-	err = router.Remove(ctx, target, "d1:k1", nil, domain.DeliveryAuth{}, nil)
+	err = router.Remove(ctx, target, "d1:k1", nil, domain.DeliveryAuth{}, nil, 1)
 	if err == nil {
 		t.Fatal("expected error for unregistered target type")
 	}
@@ -129,7 +140,7 @@ func TestRoutingDeliveryService_RegisterReplacesPrevious(t *testing.T) {
 	target := domain.TargetInfo{ID: "k1", Type: "kind", Name: "target"}
 	manifests := []domain.Manifest{{Raw: json.RawMessage(`{}`)}}
 
-	if err := router.Deliver(ctx, target, "d1:k1", manifests, domain.DeliveryAuth{}, nil); err != nil {
+	if err := router.Deliver(ctx, target, "d1:k1", manifests, domain.DeliveryAuth{}, nil, 1); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 
@@ -138,5 +149,7 @@ func TestRoutingDeliveryService_RegisterReplacesPrevious(t *testing.T) {
 	}
 	if len(second.delivered) != 1 {
 		t.Errorf("second agent received %d deliveries, want 1", len(second.delivered))
+	} else if second.delivered[0].Generation != 1 {
+		t.Errorf("second agent: Generation = %d, want 1", second.delivered[0].Generation)
 	}
 }
