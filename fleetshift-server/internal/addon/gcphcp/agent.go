@@ -295,7 +295,7 @@ func (a *Agent) Remove(
 		if err := a.reconciler.Delete(ctx, spec, targetCfg, string(auth.Token), progress); err != nil {
 			lock.Unlock()
 			a.observer.Error("failed to delete cluster", "error", err, "cluster", spec.Name)
-			if IsAuthExpiredError(err) {
+			if IsAuthExpiredError(err) || containsInvalidGrant(err) {
 				a.failDelivery(ctx, progress, domain.DeliveryStateAuthFailed,
 					fmt.Sprintf("auth expired deleting cluster %s: %v", spec.Name, err))
 			} else {
@@ -353,4 +353,3 @@ func parseTrustBundleManifest(m domain.Manifest) (domain.TrustBundleEntry, error
 	}
 	return entry, nil
 }
-

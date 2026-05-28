@@ -135,7 +135,7 @@ func TestDeliveryResultForReconcileError_SubprocessInvalidGrantReturnsAuthFailed
 	// Simulates hypershift binary returning invalid_grant in stderr,
 	// which is NOT wrapped with newAuthExpiredError because the error
 	// comes from subprocess output, not from a parsed Go error chain.
-	err := fmt.Errorf("create infra: hypershift create infra failed: exit status 1 "+
+	err := fmt.Errorf("create infra: hypershift create infra failed: exit status 1 " +
 		`(stderr: {"error":"invalid_grant","error_description":"ID Token issued at 1779857657 is stale to sign-in."})`)
 	result := deliveryResultForReconcileError(err)
 
@@ -149,7 +149,7 @@ func TestDeliveryResultForReconcileError_SubprocessInvalidGrantReturnsAuthFailed
 }
 
 func TestDeliveryResultForReconcileError_WrappedSubprocessInvalidGrantReturnsAuthFailed(t *testing.T) {
-	inner := fmt.Errorf("hypershift create infra failed: exit status 1 "+
+	inner := fmt.Errorf("hypershift create infra failed: exit status 1 " +
 		`(stderr: credentials: status code 400: {"error":"invalid_grant","error_description":"ID Token is stale"})`)
 	err := fmt.Errorf("create infra: attempt 1: %w\nattempt 2: %w", inner, inner)
 	result := deliveryResultForReconcileError(err)
@@ -210,16 +210,16 @@ func (r *agentTestReporter) ListActiveDeliveries(_ context.Context, _ []domain.T
 func withAgentHooksStubbed(t *testing.T) {
 	t.Helper()
 	origNewBrokerAuth := newBrokerAuth
-	origBuildCreateWorkspace := buildCreateHypershiftWorkspace
-	origBuildDestroyWorkspace := buildDestroyHypershiftWorkspace
+	origBuildCreateWorkspace := buildCreateWorkspaceWithTokenURL
+	origBuildDestroyWorkspace := buildDestroyWorkspaceWithTokenURL
 	origReconcileNodepools := reconcileNodepoolsFn
 	origPollClusterReady := pollClusterReadyFn
 	origCompleteGuestRegistration := completeGuestRegistrationFn
 	origPollDesiredNodepoolsHealthy := pollDesiredNodepoolsHealthyFn
 	t.Cleanup(func() {
 		newBrokerAuth = origNewBrokerAuth
-		buildCreateHypershiftWorkspace = origBuildCreateWorkspace
-		buildDestroyHypershiftWorkspace = origBuildDestroyWorkspace
+		buildCreateWorkspaceWithTokenURL = origBuildCreateWorkspace
+		buildDestroyWorkspaceWithTokenURL = origBuildDestroyWorkspace
 		reconcileNodepoolsFn = origReconcileNodepools
 		pollClusterReadyFn = origPollClusterReady
 		completeGuestRegistrationFn = origCompleteGuestRegistration
@@ -229,9 +229,10 @@ func withAgentHooksStubbed(t *testing.T) {
 	newBrokerAuth = func(BrokerAuthConfig) brokerAuthExchanger {
 		return &fakeBrokerAuth{
 			result: BrokerAuthResult{
-				BrokerToken:    "broker-token",
-				BrokerEmail:    "broker@example.com",
-				WorkforceToken: "workforce-token",
+				BrokerToken:          "broker-token",
+				BrokerEmail:          "broker@example.com",
+				WorkforceToken:       "workforce-token",
+				WorkforceTokenExpiry: time.Now().Add(time.Hour),
 			},
 		}
 	}
@@ -264,11 +265,12 @@ func TestAgent_Deliver_SuccessReportsProvisionedTargetAndSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.MkdirTemp() error = %v", err)
 	}
-	buildCreateHypershiftWorkspace = func(_ string, _ TargetConfig, _ []byte) (*HypershiftWorkspace, error) {
+	buildCreateWorkspaceWithTokenURL = func(_ string, _ TargetConfig, _ []byte, _ string, cleanupCallbacks ...func() error) (*HypershiftWorkspace, error) {
 		return &HypershiftWorkspace{
-			Env:      []string{"PATH=/usr/bin"},
-			JWKSPath: workspaceDir + "/jwks.json",
-			tempDir:  workspaceDir,
+			Env:              []string{"PATH=/usr/bin"},
+			JWKSPath:         workspaceDir + "/jwks.json",
+			tempDir:          workspaceDir,
+			cleanupCallbacks: cleanupCallbacks,
 		}, nil
 	}
 
@@ -366,7 +368,7 @@ func TestAgent_Deliver_SuccessReportsProvisionedTargetAndSecrets(t *testing.T) {
 func TestAgent_Remove_DeletesClusterViaReconciler(t *testing.T) {
 	withAgentHooksStubbed(t)
 
-	buildDestroyHypershiftWorkspace = func(_ string, _ TargetConfig) (*HypershiftWorkspace, error) {
+	buildDestroyWorkspaceWithTokenURL = func(_ string, _ TargetConfig, _ string, _ ...func() error) (*HypershiftWorkspace, error) {
 		dir, err := os.MkdirTemp("", "agent-remove-test-*")
 		if err != nil {
 			return nil, err
@@ -455,7 +457,7 @@ func TestAgent_Remove_DeletesClusterViaReconciler(t *testing.T) {
 func TestAgent_Remove_ClearsGenerationSoRecreateIsAccepted(t *testing.T) {
 	withAgentHooksStubbed(t)
 
-	buildDestroyHypershiftWorkspace = func(_ string, _ TargetConfig) (*HypershiftWorkspace, error) {
+	buildDestroyWorkspaceWithTokenURL = func(_ string, _ TargetConfig, _ string, _ ...func() error) (*HypershiftWorkspace, error) {
 		dir, err := os.MkdirTemp("", "agent-recreate-test-*")
 		if err != nil {
 			return nil, err
@@ -584,6 +586,93 @@ func TestAgent_Remove_AuthExpiredSignalsAuthFailed(t *testing.T) {
 			Raw:          spec,
 		}},
 		domain.DeliveryAuth{Token: "stale-token"},
+		nil,
+		1,
+	)
+	if err != nil {
+		t.Fatalf("Remove() should return nil (auth failures signal via reporter), got: %v", err)
+	}
+
+	select {
+	case result := <-reporter.done:
+		if result.State != domain.DeliveryStateAuthFailed {
+			t.Fatalf("reporter state = %q, want %q; message = %q",
+				result.State, domain.DeliveryStateAuthFailed, result.Message)
+		}
+		if !strings.Contains(result.Message, "auth expired") {
+			t.Fatalf("reporter message = %q, want auth expired context", result.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for reporter auth failure signal")
+	}
+}
+
+func TestAgent_Remove_SubprocessInvalidGrantSignalsAuthFailed(t *testing.T) {
+	withAgentHooksStubbed(t)
+
+	buildDestroyWorkspaceWithTokenURL = func(_ string, _ TargetConfig, _ string, _ ...func() error) (*HypershiftWorkspace, error) {
+		dir, err := os.MkdirTemp("", "agent-remove-invalid-grant-*")
+		if err != nil {
+			return nil, err
+		}
+		return &HypershiftWorkspace{
+			Env:     []string{"PATH=/usr/bin"},
+			tempDir: dir,
+		}, nil
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/clusters":
+			fmt.Fprint(w, `{"clusters":[{"id":"c-del","name":"test-cls"}]}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/clusters/c-del":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/clusters/c-del":
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error":"not found"}`)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	reporter := newAgentTestReporter()
+	agent := &Agent{
+		reconciler: &Reconciler{
+			gateway: GatewayConfig{URL: server.URL, Audience: "test-audience"},
+			infra: &fakeCleanupInfra{
+				destroyInfraErr: fmt.Errorf(
+					`hypershift destroy infra failed: exit status 1 (output: credentials: status code 400: {"error":"invalid_grant","error_description":"cached workforce token expired"})`,
+				),
+			},
+		},
+		observer:   noopObserver{},
+		reporter:   reporter,
+		trustMap:   make(map[domain.IssuerURL]domain.TrustBundleEntry),
+		clusterGen: make(map[string]domain.Generation),
+	}
+
+	spec := json.RawMessage(`{
+		"endpointAccess":"PublicAndPrivate","releaseVersion":"4.22.0","channelGroup":"stable",
+		"nodepools":[{"id":"w","replicas":2,"instanceType":"n1-standard-4",
+		"rootVolumeSize":128,"rootVolumeType":"pd-standard","autoRepair":true,"upgradeType":"Replace"}]
+	}`)
+
+	err := agent.Remove(
+		context.Background(),
+		domain.TargetInfo{Properties: map[string]string{
+			"id": "target-1", "gcp_project": "proj", "region": "us-central1",
+			"workforce_pool": "pool", "workforce_provider": "prov",
+			"broker_sa_email": "broker@example.com",
+		}},
+		domain.DeliveryID("remove-invalid-grant"),
+		[]domain.Manifest{{
+			ResourceType: ClusterResourceType,
+			Name:         "test-cls",
+			Raw:          spec,
+		}},
+		domain.DeliveryAuth{Token: "caller-token"},
 		nil,
 		1,
 	)
