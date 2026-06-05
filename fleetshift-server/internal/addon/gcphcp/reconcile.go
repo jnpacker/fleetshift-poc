@@ -104,7 +104,11 @@ func completeGuestRegistration(
 			guestTargetID,
 		)
 		if bootstrapErr == nil {
-			progress.Info(ctx, "Bootstrap successful")
+			if len(bootstrapResult.CACert) > 0 {
+				progress.Info(ctx, "Bootstrap successful (private CA extracted from kube-root-ca.crt)")
+			} else {
+				progress.Info(ctx, "Bootstrap successful (public CA, system trust)")
+			}
 			return guestEndpoint, bootstrapResult, nil
 		}
 

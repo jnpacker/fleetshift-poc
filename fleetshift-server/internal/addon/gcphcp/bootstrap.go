@@ -2,7 +2,13 @@ package gcphcp
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"time"
 
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -21,11 +27,17 @@ const (
 	platformSAName                          = "fleetshift-platform"
 	platformSANamespace                     = "kube-system"
 	defaultPlatformTokenExpirySeconds int64 = 24 * 3600
+	rootCAConfigMapName                     = "kube-root-ca.crt"
 )
 
-var newKubernetesClientForConfig = func(c *rest.Config) (kubernetes.Interface, error) {
-	return kubernetes.NewForConfig(c)
-}
+// Swappable in tests to avoid real TLS connections and API server calls.
+var (
+	newKubernetesClientForConfig = func(c *rest.Config) (kubernetes.Interface, error) {
+		return kubernetes.NewForConfig(c)
+	}
+	probeWithSystemTrustFn = probeWithSystemTrust
+	extractCAFromGuestFn   = extractCAFromGuest
+)
 
 // BootstrapResult contains the credentials and metadata obtained from
 // bootstrapping a guest cluster.
@@ -44,20 +56,38 @@ func DeliverySecretRef(targetID domain.TargetID) domain.SecretRef {
 // BootstrapGuestCluster creates a ServiceAccount with cluster-admin RBAC
 // on the guest cluster and returns a short-lived bearer token for it.
 //
-// The function uses the broker token to authenticate to the guest cluster
-// endpoint, creates the necessary resources, and extracts the credentials
-// needed for ongoing platform access. Bootstrap uses the host's normal
-// system trust store to verify the guest API endpoint.
+// Uses a three-phase connection strategy:
+//   - Phase 1: probe with system trust (handles publicly-trusted certs)
+//   - Phase 2: if x509 error, extract root CA from kube-root-ca.crt ConfigMap
+//     with leaf-cert pinning and CA-to-leaf chain validation
+//   - Phase 3: reconnect with extracted CA for all privileged operations
 func BootstrapGuestCluster(
 	ctx context.Context,
 	guestEndpoint, brokerToken string,
 	targetID domain.TargetID,
 ) (BootstrapResult, error) {
-	cfg := buildGuestBootstrapRESTConfig(guestEndpoint, brokerToken)
+	// Phase 1: try with system trust
+	client, leafDER, probeErr := probeWithSystemTrustFn(guestEndpoint, brokerToken)
 
-	client, err := newKubernetesClientForConfig(cfg)
-	if err != nil {
-		return BootstrapResult{}, fmt.Errorf("create kubernetes client: %w", err)
+	var caCert []byte
+	if probeErr != nil {
+		if !isCertVerificationError(probeErr) || leafDER == nil {
+			return BootstrapResult{}, fmt.Errorf("probe guest cluster: %w", probeErr)
+		}
+
+		// Phase 2: extract CA from guest cluster
+		var err error
+		caCert, err = extractCAFromGuestFn(ctx, guestEndpoint, brokerToken, leafDER)
+		if err != nil {
+			return BootstrapResult{}, fmt.Errorf("extract guest cluster CA: %w", err)
+		}
+
+		// Phase 3: reconnect with extracted CA
+		cfg := buildGuestBootstrapRESTConfig(guestEndpoint, brokerToken, caCert)
+		client, err = newKubernetesClientForConfig(cfg)
+		if err != nil {
+			return BootstrapResult{}, fmt.Errorf("create verified kubernetes client: %w", err)
+		}
 	}
 
 	if err := createPlatformSA(ctx, client); err != nil {
@@ -76,14 +106,19 @@ func BootstrapGuestCluster(
 	return BootstrapResult{
 		SATokenRef: ref,
 		SAToken:    token,
+		CACert:     caCert,
 	}, nil
 }
 
-func buildGuestBootstrapRESTConfig(guestEndpoint, brokerToken string) *rest.Config {
-	return &rest.Config{
+func buildGuestBootstrapRESTConfig(guestEndpoint, brokerToken string, caCert []byte) *rest.Config {
+	cfg := &rest.Config{
 		Host:        guestEndpoint,
 		BearerToken: brokerToken,
 	}
+	if len(caCert) > 0 {
+		cfg.TLSClientConfig.CAData = caCert
+	}
+	return cfg
 }
 
 // createPlatformSA creates the fleetshift-platform ServiceAccount in kube-system.
@@ -175,4 +210,141 @@ func requestPlatformSAToken(
 	}
 
 	return DeliverySecretRef(targetID), []byte(tokenReq.Status.Token), nil
+}
+
+func isCertVerificationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unknownAuth x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuth) {
+		return true
+	}
+	var unknownAuthPtr *x509.UnknownAuthorityError
+	return errors.As(err, &unknownAuthPtr)
+}
+
+func probeWithSystemTrust(guestEndpoint, brokerToken string) (kubernetes.Interface, []byte, error) {
+	var capturedLeafDER []byte
+
+	cfg := &rest.Config{
+		Host:        guestEndpoint,
+		BearerToken: brokerToken,
+	}
+	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return &leafCaptureTransport{base: rt, capture: &capturedLeafDER}
+	})
+
+	client, err := newKubernetesClientForConfig(cfg)
+	if err == nil {
+		_, err = client.Discovery().ServerVersion()
+	}
+	if err != nil {
+		if isCertVerificationError(err) && capturedLeafDER != nil {
+			return nil, capturedLeafDER, err
+		}
+		return nil, nil, err
+	}
+
+	return client, nil, nil
+}
+
+type leafCaptureTransport struct {
+	base    http.RoundTripper
+	capture *[]byte
+}
+
+func (t *leafCaptureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		host := req.URL.Hostname()
+		port := req.URL.Port()
+		if port == "" {
+			port = "443"
+		}
+		*t.capture = probeLeafCert(host + ":" + port)
+	}
+	return resp, err
+}
+
+func probeLeafCert(addr string) []byte {
+	conn, err := tls.DialWithDialer(
+		&net.Dialer{Timeout: 5 * time.Second},
+		"tcp", addr,
+		&tls.Config{InsecureSkipVerify: true},
+	)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil
+	}
+	return certs[0].Raw
+}
+
+// TODO: Review insecure TLS usage here and in probeLeafCert once migrated to
+// CLM backend — the insecure connection may be avoidable if CLM provides a
+// trusted CA path or certificate bundle.
+func extractCAFromGuest(
+	ctx context.Context,
+	guestEndpoint, brokerToken string,
+	leafDER []byte,
+) ([]byte, error) {
+	cfg := &rest.Config{
+		Host:        guestEndpoint,
+		BearerToken: brokerToken,
+		TLSClientConfig: rest.TLSClientConfig{
+			Insecure: true,
+		},
+	}
+
+	client, err := newKubernetesClientForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create insecure kubernetes client for CA extraction: %w", err)
+	}
+
+	cm, err := client.CoreV1().ConfigMaps(platformSANamespace).Get(
+		ctx,
+		rootCAConfigMapName,
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read %s/%s ConfigMap: %w", platformSANamespace, rootCAConfigMapName, err)
+	}
+
+	caPEM, ok := cm.Data["ca.crt"]
+	if !ok || caPEM == "" {
+		return nil, fmt.Errorf("ConfigMap %s/%s missing ca.crt data key", platformSANamespace, rootCAConfigMapName)
+	}
+
+	if err := validateCASignsLeaf([]byte(caPEM), leafDER); err != nil {
+		return nil, fmt.Errorf("extracted CA does not sign the server certificate: %w", err)
+	}
+
+	return []byte(caPEM), nil
+}
+
+func validateCASignsLeaf(caPEM, leafDER []byte) error {
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("failed to parse CA certificate PEM")
+	}
+
+	leaf, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		return fmt.Errorf("parse captured leaf certificate: %w", err)
+	}
+
+	// Pin to the leaf's own validity window so we only check the cryptographic
+	// signing relationship, not temporal validity. The cert was just served in a
+	// live TLS handshake; clock skew or short-lived OpenShift CAs could cause
+	// spurious rejections with time.Now(). Phase 3's TLS stack enforces expiry.
+	_, err = leaf.Verify(x509.VerifyOptions{
+		Roots:       roots,
+		CurrentTime: leaf.NotBefore.Add(time.Second),
+		KeyUsages:   []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	})
+	return err
 }
