@@ -89,29 +89,6 @@ EOF
 # --- Ensure namespace exists (needed for pull secret before full apply) ---
 oc apply -f "${K8S_DIR}/namespace.yaml"
 
-# Wait for default ServiceAccount (created asynchronously after namespace)
-for _ in $(seq 1 30); do
-  if oc get serviceaccount default -n "${NAMESPACE}" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
-oc get serviceaccount default -n "${NAMESPACE}" >/dev/null
-
-# --- Quay pull secret (must exist before pods are created) ---
-if [ -n "${QUAY_PULL_USER:-}" ] && [ -n "${QUAY_PULL_TOKEN:-}" ]; then
-  echo "Setting up quay.io pull secret..."
-  oc delete secret quay-pull-secret -n "${NAMESPACE}" --ignore-not-found=true
-  oc create secret docker-registry quay-pull-secret \
-    --docker-server=quay.io \
-    --docker-username="${QUAY_PULL_USER}" \
-    --docker-password="${QUAY_PULL_TOKEN}" \
-    -n "${NAMESPACE}"
-  oc secrets link default quay-pull-secret --for=pull -n "${NAMESPACE}"
-else
-  echo "WARNING: QUAY_PULL_USER/QUAY_PULL_TOKEN not set — image imports may fail if repos are private."
-fi
-
 # --- Apply manifests ---
 echo "Applying Kustomize manifests..."
 oc apply -k "${K8S_DIR}"
