@@ -508,9 +508,10 @@ func runServe(ctx context.Context, f *serveFlags) error {
 	}
 
 	// Dynamic managed resource HTTP routes are registered directly on
-	// topMux by the SchemaActivator. Go 1.22+ ServeMux uses
-	// longest-prefix matching, so explicit paths like /v1/clusters
-	// always take precedence over the gateway's /v1/ catch-all.
+	// topMux by the SchemaActivator at canonical
+	// /apis/{service}/{version}/{collection} prefixes. Go 1.22+ ServeMux
+	// uses longest-prefix matching, so these always take precedence over
+	// the gateway's /v1/ catch-all.
 	topMux := http.NewServeMux()
 	topMux.Handle("/v1/", gwMux)
 	topMux.HandleFunc("GET /api/ui/setup/ws", setupHub.HandleWS)
@@ -522,7 +523,12 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		Store:         store,
 		ProvenanceSvc: provenanceSvc,
 	})
-	dynamicHTTPMux := managedresource.NewDynamicHTTPMux(topMux)
+	dynamicHTTPConn, err := grpc.NewClient(f.grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("dynamic http mux grpc client: %w", err)
+	}
+	defer dynamicHTTPConn.Close()
+	dynamicHTTPMux := managedresource.NewDynamicHTTPMux(topMux, dynamicHTTPConn)
 
 	if f.webDir != "" {
 		uiMux := transporthttp.NewUIConfigMux(transporthttp.UIConfigOptions{
@@ -548,7 +554,6 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		GRPCMux:      dynamicMux,
 		HTTPMux:      dynamicHTTPMux,
 		FileRegistry: fileRegistry,
-		GRPCAddr:     f.grpcAddr,
 		Deps: managedresource.Deps{
 			Resources: managedResourceSvc,
 			Validator: specValidator,

@@ -1,39 +1,90 @@
 package managedresource
 
 import (
-	"strings"
-
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/domain"
 )
 
-// ResourceTypeConfig describes a managed resource type for dynamic service
-// registration. This is the input to the dynamic service builder — it
-// carries everything needed to build and register a typed gRPC + HTTP
-// service at runtime without compile-time Go stubs.
+// ResourceTypeConfig describes an extension service for a platform resource
+// type. This is the input to the dynamic service builder — it carries
+// everything needed to build and register a typed gRPC + HTTP service at
+// runtime without compile-time Go stubs.
+//
+// # Relationship to platform resource identity
+//
+// Each config describes an extension representation of a platform-level
+// resource type. The addon does not define a resource type in isolation;
+// it implements a platform resource type through its own typed API. Multiple
+// extensions can model the same platform resource type (e.g. one manages
+// clusters, another inventories them), each under its own APIServiceName but
+// sharing the same CollectionID.
+//
+// The relative resource name ({CollectionID}/{id}, e.g. "clusters/foo") is
+// identity-equivalent across all extensions that share a CollectionID. This
+// is how extension resources unify under a single platform identity — the
+// CollectionID is the implicit platform identity domain binding.
+//
+// See docs/design/architecture/resource_identity_and_api.md for the full
+// two-layer API model and identity semantics.
+//
+// # Current scope
+//
+// The resource hierarchy is currently flat: resource names are
+// {CollectionID}/{leaf_id} with no parent segments. Workspace and tenant
+// scoping will introduce parent collections in the future.
 type ResourceTypeConfig struct {
-	// ResourceType is the domain identifier (e.g. "clusters").
+	// ResourceType is the addon-scoped domain identifier used for
+	// internal dispatch (e.g. "api.kind.cluster"). This identifies
+	// the addon's specific implementation of the resource type — it is
+	// NOT the platform identity. Two addons modeling the same platform
+	// resource type will have different ResourceType values but the
+	// same CollectionID.
 	ResourceType domain.ResourceType
 
-	// Singular is the singular resource name in PascalCase (e.g. "Cluster",
-	// "KindCluster"). Used directly in RPC and message names like
-	// Create{Singular}, Get{Singular}Request, etc.
+	// APIServiceName is the versionless AIP-122 service name that
+	// differentiates this extension's API surface from other extensions
+	// and from the platform's canonical service. It appears in full
+	// resource names (e.g. "//kind.fleetshift.io/clusters/foo") and
+	// HTTP path prefixes. The addon chooses this; the platform imposes
+	// no convention beyond uniqueness.
+	APIServiceName string
+
+	// Version is the HTTP API version segment (e.g. "v1"). Independent
+	// of APIServiceName — the service name is versionless and stable
+	// across API version evolution.
+	Version string
+
+	// CollectionID is the AIP collection identifier that establishes
+	// platform identity domain membership. All extensions sharing the
+	// same CollectionID participate in the same platform identity domain:
+	// the relative resource name "{CollectionID}/{id}" refers to the same
+	// logical resource regardless of which extension's API is used.
+	//
+	// This is used in resource names, HTTP paths, and proto field names
+	// (e.g. "clusters"). It must be consistent across all extensions
+	// that model the same platform resource type.
+	CollectionID string
+
+	// Singular is the PascalCase singular resource name used in RPC
+	// and message names like Create{Singular}, Get{Singular}Request
+	// (e.g. "Cluster").
 	Singular string
 
-	// Plural is the plural resource name in PascalCase (e.g. "Clusters",
-	// "KindClusters"). Used directly in the List RPC and message names
-	// (List{Plural}, List{Plural}Request). The lowerCamelCase collection
-	// identifier for HTTP paths and proto field names is derived via
-	// [CollectionID].
+	// Plural is the PascalCase plural resource name used in List RPC
+	// and message names (e.g. "Clusters").
 	Plural string
 
-	// ProtoPackage is the proto package for the generated service
-	// (e.g. "fleetshift.v1").
+	// ProtoPackage is the versioned proto package for the generated
+	// service (e.g. "kind.fleetshift.v1"). Combined with Singular to
+	// form the gRPC service name ({ProtoPackage}.{Singular}Service).
+	// Each extension has its own package, avoiding service name
+	// collisions even when multiple extensions model the same
+	// CollectionID.
 	ProtoPackage string
 
 	// SpecMessage is the fully-qualified name of the addon spec message
-	// (e.g. "addons.cluster_mgmt.v1.ClusterSpec").
+	// (e.g. "addons.kind.v1.KindClusterSpec").
 	SpecMessage protoreflect.FullName
 
 	// SpecDescriptor is the pre-resolved spec message descriptor.
@@ -42,9 +93,12 @@ type ResourceTypeConfig struct {
 	SpecDescriptor protoreflect.MessageDescriptor
 }
 
-// ServiceName returns the gRPC service name (e.g. "fleetshift.v1.ClusterService").
-func (c *ResourceTypeConfig) ServiceName() string {
-	return string(c.ProtoPackage) + "." + c.Singular + "Service"
+// GRPCServiceName returns the fully-qualified gRPC service name
+// (e.g. "kind.fleetshift.v1.ClusterService"). This is extension-specific —
+// multiple extensions modeling the same platform resource type each have
+// distinct gRPC service names because they use different ProtoPackages.
+func (c *ResourceTypeConfig) GRPCServiceName() string {
+	return c.ProtoPackage + "." + c.Singular + "Service"
 }
 
 // ResourceMessageName returns the resource message name (e.g. "Cluster").
@@ -52,16 +106,20 @@ func (c *ResourceTypeConfig) ResourceMessageName() string {
 	return c.Singular
 }
 
-// CollectionID returns the lowerCamelCase collection identifier derived
-// from Plural, per AIP-122 (e.g. "KindClusters" -> "kindClusters").
-// Used for HTTP path segments, proto field names, and resource name
-// prefixes.
-func (c *ResourceTypeConfig) CollectionID() string {
-	return strings.ToLower(c.Plural[:1]) + c.Plural[1:]
+// CanonicalHTTPPrefix returns the extension-specific HTTP route prefix
+// (e.g. "/apis/kind.fleetshift.io/v1/clusters"). The APIServiceName
+// segment differentiates this extension's routes from both other
+// extensions and the platform's own canonical routes (which would be at
+// "/apis/fleetshift.io/v1/clusters" for the same identity domain).
+func (c *ResourceTypeConfig) CanonicalHTTPPrefix() string {
+	return "/apis/" + c.APIServiceName + "/" + c.Version + "/" + c.CollectionID
 }
 
-// Collection returns the resource name collection prefix
-// (e.g. "kindClusters/").
+// Collection returns the relative resource name collection prefix
+// (e.g. "clusters/"). This prefix is identity-equivalent across all
+// extensions sharing the same CollectionID — "clusters/foo" refers to
+// the same platform resource regardless of which extension service
+// produced it.
 func (c *ResourceTypeConfig) Collection() string {
-	return c.CollectionID() + "/"
+	return c.CollectionID + "/"
 }
