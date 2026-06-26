@@ -16,11 +16,8 @@ source "$(cd "$(dirname "$0")" && pwd)/common.sh"
 # AUTH_MODE is derived from AUTH for backwards compatibility within this script.
 AUTH_MODE="$AUTH"
 DB_BACKEND="$DB"
-detect_podman_socket
+ensure_podman_ready
 
-: "${KIND_TEMP_DIR:=${HOME}/.fleetshift/tmp}"
-mkdir -p "$KIND_TEMP_DIR"
-export KIND_TEMP_DIR
 podman network exists kind 2>/dev/null || podman network create kind
 
 REALM_TEMPLATE="${DEPLOY_DIR}/keycloak/fleetshift-realm.json"
@@ -60,10 +57,10 @@ if [ "${DEV:-}" = "true" ] || [ "${BUILD:-}" = "true" ]; then
   UP_ARGS+=(--build)
   podman volume rm -f web-assets podman_web-assets 2>/dev/null || true
 fi
-PODMAN_SOCKET="$PODMAN_SOCKET" compose up "${UP_ARGS[@]}"
+compose up "${UP_ARGS[@]}"
 
 if [ "$AUTH_MODE" = "local" ]; then
-  KC_URL="http://${KC_HOSTNAME:-localhost}:${KC_HTTP_PORT:-8180}/auth"
+  KC_URL="https://${KC_HOSTNAME:-keycloak}:${KC_HTTPS_PORT:-8443}/auth"
 
   echo "==> Waiting for Keycloak API..."
   until curl -sf "$KC_URL/realms/master" >/dev/null 2>&1; do
@@ -112,8 +109,7 @@ echo ""
 echo "==> FleetShift stack is running!"
 echo "    FleetShift:      http://localhost:${FLEETSHIFT_SERVER_HTTP_PORT:-8085}"
 if [ "$AUTH_MODE" = "local" ]; then
-  echo "    Keycloak Admin:  https://localhost:${KC_HTTPS_PORT:-8443}"
-  echo "    Keycloak (HTTP): http://localhost:${KC_HTTP_PORT:-8180}"
+  echo "    Keycloak Admin:  https://keycloak:${KC_HTTPS_PORT:-8443}"
   echo ""
   echo "  Keycloak Admin Console:"
   echo "    admin / ${KC_BOOTSTRAP_ADMIN_PASSWORD}"
