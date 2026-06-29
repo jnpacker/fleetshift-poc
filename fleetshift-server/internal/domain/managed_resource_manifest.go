@@ -24,7 +24,7 @@ func (s *ManagedResourceManifestStrategy) Generate(ctx context.Context, _ Genera
 	}
 	return []Manifest{{
 		ManifestType: s.Ref.ManifestType,
-		ManifestID:   ManifestID(s.Ref.Name),
+		ManifestID:   ManifestID(s.Ref.Name.ID()),
 		Raw:          intent.Spec,
 	}}, nil
 }
