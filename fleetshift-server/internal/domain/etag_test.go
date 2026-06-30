@@ -323,3 +323,89 @@ func TestExtensionResourceView_Etag_NilIntentDiffers(t *testing.T) {
 		t.Error("etag should differ between views with and without intent")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ExtensionResourceView etag tests -- inventory
+// ---------------------------------------------------------------------------
+
+func TestExtensionResourceView_Etag_ChangesOnInventoryState(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	uid := NewExtensionResourceUID()
+
+	baseSnap := ExtensionResourceSnapshot{
+		UID:          uid,
+		ResourceType: "kind.fleetshift.io/Cluster",
+		Name:         "clusters/dev",
+		Inventory: &InventoryResourceSnapshot{
+			Observation: json.RawMessage(`{"v":1}`),
+			Conditions: []ConditionSnapshot{
+				{Type: "Ready", Status: ConditionTrue, Reason: "OK", Message: "ready", LastTransitionTime: now},
+			},
+			ObservedAt: now,
+			UpdatedAt:  now.Add(time.Minute),
+		},
+		CreatedAt: now,
+		UpdatedAt: now.Add(time.Minute),
+	}
+	base := ExtensionResourceView{Resource: *ExtensionResourceFromSnapshot(baseSnap)}
+	baseEtag := base.Etag()
+
+	// Change the observation.
+	changedObsSnap := baseSnap
+	changedObsSnap.Inventory = &InventoryResourceSnapshot{
+		Observation: json.RawMessage(`{"v":2}`),
+		Conditions:  baseSnap.Inventory.Conditions,
+		ObservedAt:  now,
+		UpdatedAt:   now.Add(time.Minute),
+	}
+	changed := ExtensionResourceView{Resource: *ExtensionResourceFromSnapshot(changedObsSnap)}
+	if changed.Etag() == baseEtag {
+		t.Error("etag should change when inventory observation changes")
+	}
+
+	// Change a condition status.
+	changedCondSnap := baseSnap
+	changedCondSnap.Inventory = &InventoryResourceSnapshot{
+		Observation: json.RawMessage(`{"v":1}`),
+		Conditions: []ConditionSnapshot{
+			{Type: "Ready", Status: ConditionFalse, Reason: "NotReady", Message: "degraded", LastTransitionTime: now},
+		},
+		ObservedAt: now,
+		UpdatedAt:  now.Add(time.Minute),
+	}
+	condChanged := ExtensionResourceView{Resource: *ExtensionResourceFromSnapshot(changedCondSnap)}
+	if condChanged.Etag() == baseEtag {
+		t.Error("etag should change when condition status changes")
+	}
+}
+
+func TestExtensionResourceView_Etag_NilInventoryDiffers(t *testing.T) {
+	now := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	uid := NewExtensionResourceUID()
+
+	withInvSnap := ExtensionResourceSnapshot{
+		UID:          uid,
+		ResourceType: "kind.fleetshift.io/Cluster",
+		Name:         "clusters/dev",
+		Inventory: &InventoryResourceSnapshot{
+			Observation: json.RawMessage(`{}`),
+			ObservedAt:  now,
+			UpdatedAt:   now.Add(time.Minute),
+		},
+		CreatedAt: now,
+		UpdatedAt: now.Add(time.Minute),
+	}
+	withoutInvSnap := ExtensionResourceSnapshot{
+		UID:          uid,
+		ResourceType: "kind.fleetshift.io/Cluster",
+		Name:         "clusters/dev",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	v1 := ExtensionResourceView{Resource: *ExtensionResourceFromSnapshot(withInvSnap)}
+	v2 := ExtensionResourceView{Resource: *ExtensionResourceFromSnapshot(withoutInvSnap)}
+	if v1.Etag() == v2.Etag() {
+		t.Error("etag should differ between nil and non-nil inventory")
+	}
+}

@@ -42,7 +42,7 @@ type InventoryRepository interface {
 	CreateOrUpdate(ctx context.Context, item InventoryItem) error
 	Get(ctx context.Context, id InventoryItemID) (InventoryItem, error)
 	List(ctx context.Context) ([]InventoryItem, error)
-	ListByType(ctx context.Context, t InventoryType) ([]InventoryItem, error)
+	ListByType(ctx context.Context, t InventoryItemType) ([]InventoryItem, error)
 	Update(ctx context.Context, item InventoryItem) error
 	Delete(ctx context.Context, id InventoryItemID) error
 }
@@ -77,20 +77,39 @@ type ExtensionResourceRepository interface {
 
 	// Instance aggregate
 	Create(ctx context.Context, r *ExtensionResource) error
-	Get(ctx context.Context, rt ResourceType, name ResourceName) (*ExtensionResource, error)
+	Get(ctx context.Context, name FullResourceName) (*ExtensionResource, error)
 	GetByUID(ctx context.Context, uid ExtensionResourceUID) (*ExtensionResource, error)
 	ListByResourceType(ctx context.Context, rt ResourceType) ([]*ExtensionResource, error)
-	Delete(ctx context.Context, rt ResourceType, name ResourceName) error
+	Delete(ctx context.Context, name FullResourceName) error
 
-	// Read views (join extension resource + managed state + intent + fulfillment)
-	GetView(ctx context.Context, rt ResourceType, name ResourceName) (ExtensionResourceView, error)
+	// Read views (join extension resource + managed state + intent + fulfillment + inventory)
+	GetView(ctx context.Context, name FullResourceName) (ExtensionResourceView, error)
 	ListViewsByType(ctx context.Context, rt ResourceType) ([]ExtensionResourceView, error)
 
-	// Versioned intent (read-only; writes go through the aggregate drain)
-	GetIntent(ctx context.Context, rt ResourceType, name ResourceName, version IntentVersion) (ResourceIntent, error)
-	// Hard-delete all intent versions for an extension resource instance.
-	// Used by managed-resource cleanup after delivery-side deletion completes.
-	DeleteIntents(ctx context.Context, rt ResourceType, name ResourceName) error
+	// Versioned intent (read-only; writes go through the aggregate drain).
+	// Intents are owned by their extension resource; ON DELETE CASCADE
+	// handles cleanup when the parent is deleted.
+	GetIntent(ctx context.Context, uid ExtensionResourceUID, version IntentVersion) (ResourceIntent, error)
+
+	// Inventory latest-state upsert (narrow, not a general Save)
+	UpsertInventory(ctx context.Context, updates []InventoryUpdate) error
+
+	// Observation history (append-only)
+	AppendObservations(ctx context.Context, observations []Observation) error
+	ListObservations(ctx context.Context, uid ExtensionResourceUID, limit int) ([]Observation, error)
+
+	// Condition history -- reporters submit [ConditionReport] values;
+	// the repository deduplicates and persists only genuine transitions
+	// as [ConditionTransition] records.
+	RecordConditions(ctx context.Context, reports []ConditionReport) error
+	ListConditionTransitions(ctx context.Context, uid ExtensionResourceUID, conditionType *ConditionType, limit int) ([]ConditionTransition, error)
+}
+
+// InventoryUpdate pairs an extension resource UID with the inventory
+// state to upsert. It is a command-style DTO, not a domain object.
+type InventoryUpdate struct {
+	ExtensionResourceUID ExtensionResourceUID
+	Inventory            InventoryResource
 }
 
 // ResourceIdentityRepository persists and retrieves canonical platform

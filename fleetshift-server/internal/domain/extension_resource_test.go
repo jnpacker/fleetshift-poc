@@ -180,8 +180,7 @@ func TestExtensionResource_RecordIntent(t *testing.T) {
 	}
 
 	assertEq(t, "intent.Version", intent.Version, IntentVersion(1))
-	assertEq(t, "intent.ResourceType", intent.ResourceType, ResourceType("kind.fleetshift.io/Cluster"))
-	assertEq(t, "intent.Name", intent.Name, ResourceName("clusters/dev"))
+	assertEq(t, "intent.ExtensionResourceUID", intent.ExtensionResourceUID, uid)
 	assertEq(t, "managed.CurrentVersion", r.Managed().CurrentVersion(), IntentVersion(1))
 }
 
@@ -213,6 +212,175 @@ func TestExtensionResource_RecordIntent_WithoutManagedState(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("got %v, want ErrInvalidArgument", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ConditionType
+// ---------------------------------------------------------------------------
+
+func TestNewConditionType_Valid(t *testing.T) {
+	ct, err := NewConditionType("Ready")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertEq(t, "ConditionType", string(ct), "Ready")
+}
+
+func TestNewConditionType_Empty_Rejected(t *testing.T) {
+	_, err := NewConditionType("")
+	if err == nil {
+		t.Fatal("expected error for empty condition type")
+	}
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Errorf("got %v, want ErrInvalidArgument", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ConditionStatus
+// ---------------------------------------------------------------------------
+
+func TestParseConditionStatus_Valid(t *testing.T) {
+	for _, s := range []string{"True", "False", "Unknown"} {
+		cs, err := ParseConditionStatus(s)
+		if err != nil {
+			t.Errorf("ParseConditionStatus(%q): unexpected error: %v", s, err)
+		}
+		assertEq(t, "ConditionStatus", string(cs), s)
+	}
+}
+
+func TestParseConditionStatus_Invalid_Rejected(t *testing.T) {
+	for _, s := range []string{"", "Bogus", "true", "false"} {
+		_, err := ParseConditionStatus(s)
+		if err == nil {
+			t.Errorf("ParseConditionStatus(%q): expected error", s)
+		}
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("ParseConditionStatus(%q): got %v, want ErrInvalidArgument", s, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Condition
+// ---------------------------------------------------------------------------
+
+func TestNewCondition(t *testing.T) {
+	ct, _ := NewConditionType("Ready")
+	transTime := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	cond, err := NewCondition(ct, ConditionTrue, "AllGood", "everything is fine", transTime)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertEq(t, "Type", cond.Type(), ct)
+	assertEq(t, "Status", cond.Status(), ConditionTrue)
+	assertEq(t, "Reason", cond.Reason(), "AllGood")
+	assertEq(t, "Message", cond.Message(), "everything is fine")
+	assertEq(t, "LastTransitionTime", cond.LastTransitionTime(), transTime)
+}
+
+// ---------------------------------------------------------------------------
+// ConditionReport
+// ---------------------------------------------------------------------------
+
+func TestNewConditionReport(t *testing.T) {
+	uid := NewExtensionResourceUID()
+	ct, _ := NewConditionType("Ready")
+	ts := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	report, err := NewConditionReport(uid, ct, ConditionTrue, "AllGood", "ok", ts, ts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	assertEq(t, "ExtensionResourceUID", report.ExtensionResourceUID(), uid)
+	assertEq(t, "ConditionType", report.ConditionType(), ct)
+	assertEq(t, "Status", report.Status(), ConditionTrue)
+	assertEq(t, "Reason", report.Reason(), "AllGood")
+	assertEq(t, "Message", report.Message(), "ok")
+	assertEq(t, "LastTransitionTime", report.LastTransitionTime(), ts)
+	assertEq(t, "ObservedAt", report.ObservedAt(), ts)
+}
+
+// ---------------------------------------------------------------------------
+// InventoryType
+// ---------------------------------------------------------------------------
+
+func TestNewInventoryType(t *testing.T) {
+	it := NewInventoryType()
+	// InventoryType is a pure capability marker; nothing to assert beyond
+	// successful construction.
+	_ = it
+}
+
+// ---------------------------------------------------------------------------
+// ExtensionResourceType with Inventory
+// ---------------------------------------------------------------------------
+
+func TestExtensionResourceType_WithInventory(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	rt := ResourceType("kind.fleetshift.io/Cluster")
+
+	ert := NewExtensionResourceType(rt, "v1", "clusters", now,
+		WithInventory(),
+	)
+
+	if ert.Inventory() == nil {
+		t.Fatal("expected non-nil inventory")
+	}
+}
+
+func TestExtensionResourceType_ManagedOnly_NoInventory(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	rt := ResourceType("kind.fleetshift.io/Cluster")
+	relation := NewRegisteredSelfTarget("target-kind", "managed-resource")
+	sig := Signature{Signer: FederatedIdentity{Subject: "addon", Issuer: "https://issuer.example.com"}}
+
+	ert := NewExtensionResourceType(rt, "v1", "clusters", now,
+		WithManagement(relation, sig),
+	)
+
+	if ert.Inventory() != nil {
+		t.Error("expected nil inventory for managed-only type")
+	}
+}
+
+func TestExtensionResourceType_InventoryOnly_NoManagement(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	rt := ResourceType("kind.fleetshift.io/Cluster")
+
+	ert := NewExtensionResourceType(rt, "v1", "clusters", now,
+		WithInventory(),
+	)
+
+	if ert.Management() != nil {
+		t.Error("expected nil management for inventory-only type")
+	}
+	if ert.Inventory() == nil {
+		t.Fatal("expected non-nil inventory")
+	}
+}
+
+func TestExtensionResourceType_ManagedPlusInventory(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	rt := ResourceType("kind.fleetshift.io/Cluster")
+	relation := NewRegisteredSelfTarget("target-kind", "managed-resource")
+	sig := Signature{Signer: FederatedIdentity{Subject: "addon", Issuer: "https://issuer.example.com"}}
+
+	ert := NewExtensionResourceType(rt, "v1", "clusters", now,
+		WithManagement(relation, sig),
+		WithInventory(),
+	)
+
+	if ert.Management() == nil {
+		t.Fatal("expected non-nil management")
+	}
+	if ert.Inventory() == nil {
+		t.Fatal("expected non-nil inventory")
 	}
 }
 
