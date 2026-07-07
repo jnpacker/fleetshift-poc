@@ -50,6 +50,8 @@ type CreatePlatformResourceInput struct {
 // on resource_name surfaces [domain.ErrAlreadyExists] if the name is
 // already taken (per AIP-133: Create must not silently update an
 // existing resource).
+//
+// TODO: Probably remove this – we'll have user managed platform resource state in its own API
 func (s *PlatformResourceService) Create(ctx context.Context, in CreatePlatformResourceInput) (*domain.PlatformResource, error) {
 	tx, err := s.store.Begin(ctx)
 	if err != nil {
@@ -58,8 +60,7 @@ func (s *PlatformResourceService) Create(ctx context.Context, in CreatePlatformR
 	defer tx.Rollback()
 
 	now := s.now()
-	uid := domain.NewPlatformResourceUID()
-	pr := domain.NewPlatformResource(uid, in.Name, in.Labels, now)
+	pr := domain.NewPlatformResource(in.Name, in.Labels, now)
 
 	if err := tx.ResourceIdentities().Create(ctx, pr); err != nil {
 		return nil, fmt.Errorf("create: %w", err)

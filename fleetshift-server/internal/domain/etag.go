@@ -41,7 +41,9 @@ func hashExtensionResourceFields(h hash.Hash, v ExtensionResourceView) {
 		hashBytes(h, v.Intent.Spec)
 	}
 	if v.Resource.inventory != nil {
-		hashBytes(h, v.Resource.inventory.observation)
+		if v.Resource.inventory.observation != nil {
+			hashBytes(h, *v.Resource.inventory.observation)
+		}
 		binary.Write(h, binary.BigEndian, int64(len(v.Resource.inventory.conditions)))
 		for _, c := range v.Resource.inventory.conditions {
 			hashString(h, string(c.conditionType))
@@ -51,6 +53,7 @@ func hashExtensionResourceFields(h hash.Hash, v ExtensionResourceView) {
 		}
 		binary.Write(h, binary.BigEndian, v.Resource.inventory.observedAt.UnixNano())
 	}
+	hashAliases(h, v.Resource.reportedAliases)
 }
 
 func hashDeploymentFields(h hash.Hash, v DeploymentView) {
@@ -80,6 +83,15 @@ func hashString(h hash.Hash, s string) {
 func hashBytes(h hash.Hash, b []byte) {
 	binary.Write(h, binary.BigEndian, int64(len(b)))
 	h.Write(b)
+}
+
+func hashAliases(h hash.Hash, aliases AliasSet) {
+	binary.Write(h, binary.BigEndian, int64(aliases.Len()))
+	for alias := range aliases.All() {
+		hashString(h, string(alias.Namespace()))
+		hashString(h, string(alias.Key()))
+		hashString(h, string(alias.Value()))
+	}
 }
 
 func weakEtag(h hash.Hash) Etag {

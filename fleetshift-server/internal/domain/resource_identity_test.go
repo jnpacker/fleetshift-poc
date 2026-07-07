@@ -1,10 +1,16 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
+
+func collectAliasSet(set AliasSet) []Alias {
+	return set.Slice()
+}
 
 // ---------------------------------------------------------------------------
 // Value object constructors
@@ -153,10 +159,115 @@ func TestNewAlias(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got.Namespace != tt.ns || got.Key != tt.key || got.Value != tt.value {
+			if got.Namespace() != tt.ns || got.Key() != tt.key || got.Value() != tt.value {
 				t.Errorf("got %+v, want ns=%q key=%q value=%q", got, tt.ns, tt.key, tt.value)
 			}
 		})
+	}
+}
+
+func TestAliasSet_CanonicalizesSortsAndMergesByRef(t *testing.T) {
+	projectV1, err := NewAlias("gcp", "project_id", "proj-v1")
+	if err != nil {
+		t.Fatalf("NewAlias(projectV1): %v", err)
+	}
+	projectV2, err := NewAlias("gcp", "project_id", "proj-v2")
+	if err != nil {
+		t.Fatalf("NewAlias(projectV2): %v", err)
+	}
+	zone, err := NewAlias("gcp", "zone", "us-central1-a")
+	if err != nil {
+		t.Fatalf("NewAlias(zone): %v", err)
+	}
+	account, err := NewAlias("aws", "account_id", "123456789012")
+	if err != nil {
+		t.Fatalf("NewAlias(account): %v", err)
+	}
+
+	set := NewAliasSet([]Alias{zone, projectV1, account, projectV2})
+
+	if got := set.Len(); got != 3 {
+		t.Fatalf("Len() = %d, want 3", got)
+	}
+
+	var got []Alias
+	for alias := range set.All() {
+		got = append(got, alias)
+	}
+	want := []Alias{account, projectV2, zone}
+	if len(got) != len(want) {
+		t.Fatalf("All() len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("All()[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestAliasSet_Slice_ReturnsCanonicalCopy(t *testing.T) {
+	project, err := NewAlias("gcp", "project_id", "proj-1")
+	if err != nil {
+		t.Fatalf("NewAlias(project): %v", err)
+	}
+	zone, err := NewAlias("gcp", "zone", "us-central1-a")
+	if err != nil {
+		t.Fatalf("NewAlias(zone): %v", err)
+	}
+
+	set := NewAliasSet([]Alias{zone, project})
+	got := set.Slice()
+	want := []Alias{project, zone}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Slice() = %+v, want %+v", got, want)
+	}
+
+	got[0] = zone
+	if again := set.Slice(); !slices.Equal(again, want) {
+		t.Fatalf("Slice() after mutating returned slice = %+v, want %+v", again, want)
+	}
+}
+
+func TestAlias_JSONRoundTrip_UsesSnapshotShape(t *testing.T) {
+	alias, err := NewAlias("gcp", "project_id", "my-proj")
+	if err != nil {
+		t.Fatalf("NewAlias: %v", err)
+	}
+
+	data, err := json.Marshal(alias)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	if got, want := string(data), `{"namespace":"gcp","key":"project_id","value":"my-proj"}`; got != want {
+		t.Fatalf("MarshalJSON() = %s, want %s", got, want)
+	}
+
+	var roundTripped Alias
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("UnmarshalJSON: %v", err)
+	}
+	if roundTripped != alias {
+		t.Fatalf("roundTripped = %+v, want %+v", roundTripped, alias)
+	}
+}
+
+func TestAliasSet_JSONRoundTrip_EmptyUsesArrayLiteral(t *testing.T) {
+	var set AliasSet
+
+	data, err := json.Marshal(set)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	if got, want := string(data), `[]`; got != want {
+		t.Fatalf("MarshalJSON() = %s, want %s", got, want)
+	}
+
+	var roundTripped AliasSet
+	if err := json.Unmarshal(data, &roundTripped); err != nil {
+		t.Fatalf("UnmarshalJSON: %v", err)
+	}
+	if got := roundTripped.Len(); got != 0 {
+		t.Fatalf("roundTripped.Len() = %d, want 0", got)
 	}
 }
 
@@ -355,63 +466,17 @@ func TestResourceName_FullName(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PlatformResourceUID
-// ---------------------------------------------------------------------------
-
-func TestPlatformResourceUID_NewAndParse(t *testing.T) {
-	uid := NewPlatformResourceUID()
-	if uid.IsZero() {
-		t.Fatal("NewPlatformResourceUID returned zero UUID")
-	}
-
-	s := uid.String()
-	parsed, err := ParsePlatformResourceUID(s)
-	if err != nil {
-		t.Fatalf("ParsePlatformResourceUID(%q): %v", s, err)
-	}
-	if parsed != uid {
-		t.Errorf("round-trip: got %s, want %s", parsed, uid)
-	}
-}
-
-func TestPlatformResourceUID_TextRoundTrip(t *testing.T) {
-	uid := NewPlatformResourceUID()
-	text, err := uid.MarshalText()
-	if err != nil {
-		t.Fatalf("MarshalText: %v", err)
-	}
-	var parsed PlatformResourceUID
-	if err := parsed.UnmarshalText(text); err != nil {
-		t.Fatalf("UnmarshalText: %v", err)
-	}
-	if parsed != uid {
-		t.Errorf("round-trip: got %s, want %s", parsed, uid)
-	}
-}
-
-func TestPlatformResourceUID_SQLRoundTrip(t *testing.T) {
-	uid := NewPlatformResourceUID()
-	val, err := uid.Value()
-	if err != nil {
-		t.Fatalf("Value: %v", err)
-	}
-	var parsed PlatformResourceUID
-	if err := parsed.Scan(val); err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
-	if parsed != uid {
-		t.Errorf("round-trip: got %s, want %s", parsed, uid)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // PlatformResource aggregate mutation methods
+//
+// PlatformResource has no surrogate UID -- ResourceName is its sole
+// identifier (see resource_identity.go's package-level doc and
+// docs/design/architecture/resource_identity_and_api.md). There is no
+// PlatformResourceUID type to test here.
 // ---------------------------------------------------------------------------
 
 func TestPlatformResource_SetLabels(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", map[string]string{"a": "1"}, now)
+	r := NewPlatformResource("clusters/prod", map[string]string{"a": "1"}, now)
 
 	later := now.Add(time.Hour)
 	r.SetLabels(map[string]string{"b": "2"}, later)
@@ -430,178 +495,33 @@ func TestPlatformResource_SetLabels(t *testing.T) {
 	}
 }
 
-func TestPlatformResource_AttachRepresentation(t *testing.T) {
-	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
-
-	erUID := NewExtensionResourceUID()
-	later := now.Add(time.Hour)
-	err := r.AttachRepresentation(AttachRepresentationInput{
-		ServiceName:          "kind.fleetshift.io",
-		Version:              "v1alpha1",
-		ExtensionResourceUID: erUID,
-	}, later)
-	if err != nil {
-		t.Fatalf("AttachRepresentation: %v", err)
-	}
-
-	reps := r.Representations()
-	if len(reps) != 1 {
-		t.Fatalf("len(Representations) = %d, want 1", len(reps))
-	}
-	if reps[0].ServiceName() != "kind.fleetshift.io" {
-		t.Errorf("ServiceName = %q, want kind.fleetshift.io", reps[0].ServiceName())
-	}
-	if reps[0].Version() != "v1alpha1" {
-		t.Errorf("Version = %q, want v1alpha1", reps[0].Version())
-	}
-	if reps[0].ExtensionResourceUID() != erUID {
-		t.Errorf("ExtensionResourceUID = %s, want %s", reps[0].ExtensionResourceUID(), erUID)
-	}
-	if reps[0].PlatformUID() != uid {
-		t.Errorf("PlatformUID = %s, want %s", reps[0].PlatformUID(), uid)
-	}
-	if reps[0].Name() != "clusters/prod" {
-		t.Errorf("Name = %q, want clusters/prod (inherited from aggregate)", reps[0].Name())
-	}
-}
-
-func TestPlatformResource_AttachRepresentation_UpdatesExisting(t *testing.T) {
-	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
-
-	erUID := NewExtensionResourceUID()
-	err := r.AttachRepresentation(AttachRepresentationInput{
-		ServiceName:          "kind.fleetshift.io",
-		Version:              "v1alpha1",
-		ExtensionResourceUID: erUID,
-	}, now)
-	if err != nil {
-		t.Fatalf("first attach: %v", err)
-	}
-
-	later := now.Add(time.Hour)
-	err = r.AttachRepresentation(AttachRepresentationInput{
-		ServiceName:          "kind.fleetshift.io",
-		Version:              "v1beta1",
-		ExtensionResourceUID: erUID,
-	}, later)
-	if err != nil {
-		t.Fatalf("second attach: %v", err)
-	}
-
-	reps := r.Representations()
-	if len(reps) != 1 {
-		t.Fatalf("len(Representations) = %d, want 1 (upsert)", len(reps))
-	}
-	if reps[0].Version() != "v1beta1" {
-		t.Errorf("Version = %q, want v1beta1", reps[0].Version())
-	}
-}
-
-func TestPlatformResource_AttachRepresentation_ExtensionResourceUID_RoundTrips(t *testing.T) {
-	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
-	erUID := NewExtensionResourceUID()
-
-	err := r.AttachRepresentation(AttachRepresentationInput{
-		ServiceName:          "kind.fleetshift.io",
-		Version:              "v1",
-		ExtensionResourceUID: erUID,
-	}, now)
-	if err != nil {
-		t.Fatalf("AttachRepresentation: %v", err)
-	}
-
-	reps := r.Representations()
-	if len(reps) != 1 {
-		t.Fatalf("len(Representations) = %d, want 1", len(reps))
-	}
-	if reps[0].ExtensionResourceUID() != erUID {
-		t.Errorf("ExtensionResourceUID = %s, want %s", reps[0].ExtensionResourceUID(), erUID)
-	}
-
-	snap := reps[0].Snapshot()
-	if snap.ExtensionResourceUID != erUID {
-		t.Error("snapshot did not preserve ExtensionResourceUID")
-	}
-
-	roundTripped := ResourceRepresentationFromSnapshot(snap)
-	if roundTripped.ExtensionResourceUID() != erUID {
-		t.Error("round-trip from snapshot did not preserve ExtensionResourceUID")
-	}
-}
-
-func TestPlatformResource_DeleteRepresentation(t *testing.T) {
-	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
-
-	err := r.AttachRepresentation(AttachRepresentationInput{
-		ServiceName:          "kind.fleetshift.io",
-		Version:              "v1",
-		ExtensionResourceUID: NewExtensionResourceUID(),
-	}, now)
-	if err != nil {
-		t.Fatalf("attach: %v", err)
-	}
-
-	later := now.Add(time.Hour)
-	err = r.DeleteRepresentation("kind.fleetshift.io", later)
-	if err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-
-	if len(r.Representations()) != 0 {
-		t.Errorf("representations len = %d, want 0", len(r.Representations()))
-	}
-
-	all := r.AllRepresentations()
-	if len(all) != 1 {
-		t.Fatalf("all representations len = %d, want 1", len(all))
-	}
-	if !all[0].Deleted() {
-		t.Fatal("Deleted is false, want true")
-	}
-}
-
-func TestPlatformResource_DeleteRepresentation_NotFound(t *testing.T) {
-	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
-
-	err := r.DeleteRepresentation("missing.io", now)
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("delete missing: got %v, want ErrNotFound", err)
-	}
-}
+// Representation attach/update/delete behavior no longer lives on
+// PlatformResource -- representations are derived on read by the
+// repository (joining extension resources to platform resources by
+// name); see resourceidentityrepotest.Run's representation-related
+// subtests for the corresponding coverage at that layer.
 
 func TestPlatformResource_AddAlias(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
 	alias, _ := NewAlias("gcp", "project_id", "my-proj")
 	if err := r.AddAlias(alias); err != nil {
 		t.Fatalf("AddAlias: %v", err)
 	}
 
-	aliases := r.Aliases()
+	aliases := collectAliasSet(r.Aliases())
 	if len(aliases) != 1 {
 		t.Fatalf("len(Aliases) = %d, want 1", len(aliases))
 	}
-	if aliases[0].Namespace != "gcp" {
-		t.Errorf("Namespace = %q, want gcp", aliases[0].Namespace)
+	if aliases[0].Namespace() != "gcp" {
+		t.Errorf("Namespace = %q, want gcp", aliases[0].Namespace())
 	}
 }
 
 func TestPlatformResource_AddAlias_Idempotent(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
 	alias, _ := NewAlias("gcp", "project_id", "my-proj")
 	if err := r.AddAlias(alias); err != nil {
@@ -611,15 +531,14 @@ func TestPlatformResource_AddAlias_Idempotent(t *testing.T) {
 		t.Fatalf("second AddAlias (idempotent): %v", err)
 	}
 
-	if len(r.Aliases()) != 1 {
-		t.Errorf("len(Aliases) = %d, want 1 (idempotent)", len(r.Aliases()))
+	if r.Aliases().Len() != 1 {
+		t.Errorf("len(Aliases) = %d, want 1 (idempotent)", r.Aliases().Len())
 	}
 }
 
 func TestPlatformResource_AddAlias_RejectsConflictingValue(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
 	first, _ := NewAlias("gcp", "project_id", "proj-a")
 	if err := r.AddAlias(first); err != nil {
@@ -632,19 +551,18 @@ func TestPlatformResource_AddAlias_RejectsConflictingValue(t *testing.T) {
 		t.Errorf("conflicting alias: got %v, want ErrInvalidArgument", err)
 	}
 
-	aliases := r.Aliases()
+	aliases := collectAliasSet(r.Aliases())
 	if len(aliases) != 1 {
 		t.Fatalf("len(Aliases) = %d, want 1", len(aliases))
 	}
-	if aliases[0].Value != "proj-a" {
-		t.Errorf("Value = %q, want proj-a (unchanged)", aliases[0].Value)
+	if aliases[0].Value() != "proj-a" {
+		t.Errorf("Value = %q, want proj-a (unchanged)", aliases[0].Value())
 	}
 }
 
 func TestPlatformResource_AddAlias_AllowsDifferentKeysInSameNamespace(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
 	a1, _ := NewAlias("gcp", "project_id", "proj-a")
 	a2, _ := NewAlias("gcp", "zone", "us-central1-a")
@@ -655,18 +573,16 @@ func TestPlatformResource_AddAlias_AllowsDifferentKeysInSameNamespace(t *testing
 		t.Fatalf("second AddAlias: %v", err)
 	}
 
-	if len(r.Aliases()) != 2 {
-		t.Errorf("len(Aliases) = %d, want 2", len(r.Aliases()))
+	if r.Aliases().Len() != 2 {
+		t.Errorf("len(Aliases) = %d, want 2", r.Aliases().Len())
 	}
 }
 
 func TestPlatformResource_AddRelationship(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid1 := NewPlatformResourceUID()
-	uid2 := NewPlatformResourceUID()
-	r := NewPlatformResource(uid1, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
-	err := r.AddRelationship(NewResourceRelationship(uid1, "runs-on", uid2, "kind.fleetshift.io", now))
+	err := r.AddRelationship(NewResourceRelationship("clusters/prod", "runs-on", "clusters/host", "kind.fleetshift.io", now))
 	if err != nil {
 		t.Fatalf("AddRelationship: %v", err)
 	}
@@ -682,26 +598,21 @@ func TestPlatformResource_AddRelationship(t *testing.T) {
 
 func TestPlatformResource_AddRelationship_RejectsEmptyType(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid1 := NewPlatformResourceUID()
-	uid2 := NewPlatformResourceUID()
-	r := NewPlatformResource(uid1, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
-	err := r.AddRelationship(NewResourceRelationship(uid1, "", uid2, "kind.fleetshift.io", now))
+	err := r.AddRelationship(NewResourceRelationship("clusters/prod", "", "clusters/host", "kind.fleetshift.io", now))
 	if !errors.Is(err, ErrInvalidArgument) {
 		t.Errorf("empty type: got %v, want ErrInvalidArgument", err)
 	}
 }
 
-func TestPlatformResource_AddRelationship_RejectsForeignSourceUID(t *testing.T) {
+func TestPlatformResource_AddRelationship_RejectsForeignSourceName(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid1 := NewPlatformResourceUID()
-	uid2 := NewPlatformResourceUID()
-	foreignUID := NewPlatformResourceUID()
-	r := NewPlatformResource(uid1, "clusters/prod", nil, now)
+	r := NewPlatformResource("clusters/prod", nil, now)
 
-	err := r.AddRelationship(NewResourceRelationship(foreignUID, "runs-on", uid2, "kind.fleetshift.io", now))
+	err := r.AddRelationship(NewResourceRelationship("clusters/other", "runs-on", "clusters/host", "kind.fleetshift.io", now))
 	if !errors.Is(err, ErrInvalidArgument) {
-		t.Errorf("foreign source UID: got %v, want ErrInvalidArgument", err)
+		t.Errorf("foreign source name: got %v, want ErrInvalidArgument", err)
 	}
 	if len(r.Relationships()) != 0 {
 		t.Error("relationship should not have been added")
@@ -710,8 +621,7 @@ func TestPlatformResource_AddRelationship_RejectsForeignSourceUID(t *testing.T) 
 
 func TestPlatformResource_EffectiveLabels(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", map[string]string{"env": "prod", "team": "infra"}, now)
+	r := NewPlatformResource("clusters/prod", map[string]string{"env": "prod", "team": "infra"}, now)
 
 	got := r.EffectiveLabels()
 
@@ -724,8 +634,7 @@ func TestPlatformResource_EffectiveLabels(t *testing.T) {
 
 func TestPlatformResource_EffectiveLabels_ReturnsCopy(t *testing.T) {
 	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
-	uid := NewPlatformResourceUID()
-	r := NewPlatformResource(uid, "clusters/prod", map[string]string{"env": "prod"}, now)
+	r := NewPlatformResource("clusters/prod", map[string]string{"env": "prod"}, now)
 
 	got := r.EffectiveLabels()
 	got["env"] = "mutated"

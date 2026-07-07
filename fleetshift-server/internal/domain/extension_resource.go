@@ -203,19 +203,23 @@ func NewInventoryType() InventoryType { return InventoryType{} }
 
 // InventoryResource holds the latest inventory state for an extension
 // resource instance. Reconstituted from persistence via snapshot.
+//
+// observation is a pointer so "no latest observation" (nil) is
+// representable distinct from "the latest observation is an empty JSON
+// object" ({}).
 type InventoryResource struct {
 	labels      map[string]string
-	observation json.RawMessage
+	observation *json.RawMessage
 	conditions  []Condition
 	observedAt  time.Time
 	updatedAt   time.Time
 }
 
-func (ir *InventoryResource) Labels() map[string]string    { return ir.labels }
-func (ir *InventoryResource) Observation() json.RawMessage { return ir.observation }
-func (ir *InventoryResource) Conditions() []Condition      { return ir.conditions }
-func (ir *InventoryResource) ObservedAt() time.Time        { return ir.observedAt }
-func (ir *InventoryResource) UpdatedAt() time.Time         { return ir.updatedAt }
+func (ir *InventoryResource) Labels() map[string]string     { return ir.labels }
+func (ir *InventoryResource) Observation() *json.RawMessage { return ir.observation }
+func (ir *InventoryResource) Conditions() []Condition       { return ir.conditions }
+func (ir *InventoryResource) ObservedAt() time.Time         { return ir.observedAt }
+func (ir *InventoryResource) UpdatedAt() time.Time          { return ir.updatedAt }
 
 // ---------------------------------------------------------------------------
 // Observation -- inventory observation history record
@@ -223,6 +227,17 @@ func (ir *InventoryResource) UpdatedAt() time.Time         { return ir.updatedAt
 
 // ObservationID uniquely identifies an observation history record.
 type ObservationID string
+
+// NewObservationID generates a new random [ObservationID]. Neither
+// [ExtensionResourceRepository.ReplaceInventory] nor
+// [ExtensionResourceRepository.ApplyInventoryDeltas] calls this today
+// -- see [ExtensionResourceRepository.ListObservations]'s doc -- since
+// neither appends observation history synchronously any more. It
+// remains for a future asynchronous history writer to use; reporters
+// never supply observation IDs directly.
+func NewObservationID() ObservationID {
+	return ObservationID(uuid.New().String())
+}
 
 // Observation is a single observation history record for an extension
 // resource instance. It captures the raw observation payload and the
@@ -260,63 +275,18 @@ func (o Observation) ObservedAt() time.Time                      { return o.obse
 func (o Observation) CreatedAt() time.Time                       { return o.createdAt }
 
 // ---------------------------------------------------------------------------
-// ConditionReport -- observed condition state submitted by reporters
-// ---------------------------------------------------------------------------
-
-// ConditionReport is the observed state of a single condition on an
-// extension resource. Reporters submit reports without knowing whether
-// they represent a genuine transition; that determination is made by
-// the repository when it records the condition (see
-// [ExtensionResourceRepository.RecordConditions]).
-type ConditionReport struct {
-	extensionResourceUID ExtensionResourceUID
-	conditionType        ConditionType
-	status               ConditionStatus
-	reason               string
-	message              string
-	lastTransitionTime   time.Time
-	observedAt           time.Time
-}
-
-// NewConditionReport constructs a [ConditionReport].
-func NewConditionReport(
-	erUID ExtensionResourceUID,
-	conditionType ConditionType,
-	status ConditionStatus,
-	reason, message string,
-	lastTransitionTime time.Time,
-	observedAt time.Time,
-) (ConditionReport, error) {
-	return ConditionReport{
-		extensionResourceUID: erUID,
-		conditionType:        conditionType,
-		status:               status,
-		reason:               reason,
-		message:              message,
-		lastTransitionTime:   lastTransitionTime,
-		observedAt:           observedAt,
-	}, nil
-}
-
-func (r ConditionReport) ExtensionResourceUID() ExtensionResourceUID { return r.extensionResourceUID }
-func (r ConditionReport) ConditionType() ConditionType               { return r.conditionType }
-func (r ConditionReport) Status() ConditionStatus                    { return r.status }
-func (r ConditionReport) Reason() string                             { return r.reason }
-func (r ConditionReport) Message() string                            { return r.message }
-func (r ConditionReport) LastTransitionTime() time.Time              { return r.lastTransitionTime }
-func (r ConditionReport) ObservedAt() time.Time                      { return r.observedAt }
-
-// ---------------------------------------------------------------------------
 // ConditionTransition -- realized condition state change
 // ---------------------------------------------------------------------------
 
 // ConditionTransitionID uniquely identifies a recorded condition
-// transition. Generated by the repository when a [ConditionReport]
+// transition. Generated by the repository when a supplied [Condition]
 // survives the deduplication constraint.
 type ConditionTransitionID string
 
 // ConditionTransition is a persisted condition state change. It is
-// produced by the repository when a [ConditionReport] represents a
+// produced by the repository when a [Condition] supplied to
+// [ExtensionResourceRepository.ReplaceInventory] or
+// [ExtensionResourceRepository.ApplyInventoryDeltas] represents a
 // genuine transition (the (status, reason, message) tuple differs from
 // the latest entry for the same (resource, condition type) pair).
 // Callers never construct transitions directly; they are returned by
@@ -545,6 +515,11 @@ type ExtensionResource struct {
 	managed   *ManagedState
 	inventory *InventoryResource
 
+	// reportedAliases holds this extension resource's own pending,
+	// unreconciled alias assertions -- see
+	// [InventoryReplacement.Aliases]'s doc for the full contract.
+	reportedAliases AliasSet
+
 	createdAt time.Time
 	updatedAt time.Time
 
@@ -654,6 +629,11 @@ func (r *ExtensionResource) Managed() *ManagedState { return r.managed }
 // Inventory returns the latest inventory state, or nil if no inventory
 // has been reported.
 func (r *ExtensionResource) Inventory() *InventoryResource { return r.inventory }
+
+// ReportedAliases returns this extension resource's own pending,
+// unreconciled alias assertions -- see [InventoryReplacement.Aliases]'s
+// doc for the contract these are stored under.
+func (r *ExtensionResource) ReportedAliases() AliasSet { return r.reportedAliases }
 
 // CreatedAt returns the creation timestamp.
 func (r *ExtensionResource) CreatedAt() time.Time { return r.createdAt }

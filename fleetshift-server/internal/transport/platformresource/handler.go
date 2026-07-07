@@ -253,9 +253,6 @@ func (h *platformHandler) resourceToMessage(pr *domain.PlatformResource) (proto.
 	nameField := h.descs.Resource.Fields().ByName("name")
 	msg.Set(nameField, protoreflect.ValueOfString(string(pr.Name())))
 
-	uidField := h.descs.Resource.Fields().ByName("uid")
-	msg.Set(uidField, protoreflect.ValueOfString(pr.UID().String()))
-
 	labelsField := h.descs.Resource.Fields().ByName("labels")
 	setMapStringString(msg, labelsField, pr.Labels())
 
@@ -286,11 +283,11 @@ func (h *platformHandler) resourceToMessage(pr *domain.PlatformResource) (proto.
 	aliasesField := h.descs.Resource.Fields().ByName("aliases")
 	aliasList := msg.Mutable(aliasesField).List()
 	aliasDesc := aliasesField.Message()
-	for _, alias := range pr.Aliases() {
+	for alias := range pr.Aliases().All() {
 		aliasMsg := dynamicpb.NewMessage(aliasDesc)
-		aliasMsg.Set(aliasDesc.Fields().ByName("namespace"), protoreflect.ValueOfString(string(alias.Namespace)))
-		aliasMsg.Set(aliasDesc.Fields().ByName("key"), protoreflect.ValueOfString(string(alias.Key)))
-		aliasMsg.Set(aliasDesc.Fields().ByName("value"), protoreflect.ValueOfString(string(alias.Value)))
+		aliasMsg.Set(aliasDesc.Fields().ByName("namespace"), protoreflect.ValueOfString(string(alias.Namespace())))
+		aliasMsg.Set(aliasDesc.Fields().ByName("key"), protoreflect.ValueOfString(string(alias.Key())))
+		aliasMsg.Set(aliasDesc.Fields().ByName("value"), protoreflect.ValueOfString(string(alias.Value())))
 		aliasList.Append(protoreflect.ValueOfMessage(aliasMsg))
 	}
 
@@ -300,7 +297,7 @@ func (h *platformHandler) resourceToMessage(pr *domain.PlatformResource) (proto.
 	for _, rel := range pr.Relationships() {
 		relMsg := dynamicpb.NewMessage(relDesc)
 		relMsg.Set(relDesc.Fields().ByName("type"), protoreflect.ValueOfString(string(rel.Type())))
-		relMsg.Set(relDesc.Fields().ByName("target_uid"), protoreflect.ValueOfString(rel.TargetUID().String()))
+		relMsg.Set(relDesc.Fields().ByName("target_name"), protoreflect.ValueOfString(string(rel.TargetName())))
 		relMsg.Set(relDesc.Fields().ByName("source_service"), protoreflect.ValueOfString(string(rel.SourceService())))
 		if !rel.CreatedAt().IsZero() {
 			if tsVal, err := dynamicapi.MarshalTimestamp(relDesc.Fields().ByName("create_time"), rel.CreatedAt()); err == nil {

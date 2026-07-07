@@ -224,11 +224,13 @@ func TestKindAddon_ManagedResource_EndToEnd(t *testing.T) {
 	}
 
 	// --- Step 4: Create extension resource ---
-	spec := json.RawMessage(`{"name":"mr-cluster","nodes":[{"role":"control-plane"},{"role":"worker"}]}`)
+	// No "name" in the spec body: for managed resources the cluster
+	// name comes from the resource's own name below, not the spec.
+	spec := json.RawMessage(`{"nodes":[{"role":"control-plane"},{"role":"worker"}]}`)
 
 	view, err := resourceSvc.Create(ctx, application.CreateExtensionResourceInput{
 		ResourceType: kindaddon.ClusterResourceType,
-		Name:         "mr-cluster",
+		Name:         "clusters/mr-cluster",
 		Spec:         spec,
 	})
 	if err != nil {
@@ -239,6 +241,9 @@ func TestKindAddon_ManagedResource_EndToEnd(t *testing.T) {
 	awaitFulfillment(ctx, t, store, view.Fulfillment.ID(), domain.FulfillmentStateActive)
 
 	<-provider.created
+	// The kind cluster/container name must be the bare resource ID
+	// ("mr-cluster"), not the full resource name ("clusters/mr-cluster")
+	// -- docker/podman reject "/" in container names.
 	if !provider.hasCluster("mr-cluster") {
 		t.Error("expected kind cluster 'mr-cluster' to be created by the provider")
 	}

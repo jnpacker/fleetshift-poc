@@ -207,6 +207,38 @@ How should addons declare their permission schema to the platform: SpiceDB ZED, 
 
 **Context:** During bootstrap, infrastructure state may need to move from the local bootstrap environment into the real cluster. The open questions are whether `clusterctl move` should run as a subprocess or be reimplemented with client libraries, what state beyond CAPI objects needs to transfer, whether ordinary `DeploymentGroup` sequencing is enough, and how recovery should work if the move fails mid-pivot.
 
+## Resource identity and aliases
+
+### Explicit identity state for representations with pending or conflicting aliases
+
+**Question:** Should a representation read (`ResourceIdentityRepository.GetRepresentation`) expose an explicit identity state -- accepted, pending, or (once conflict detection exists for reported aliases) conflicting -- instead of the current present-or-absent check alone?
+
+**Context:** Representation is derived purely by name match today, regardless of an extension resource's `reported_aliases` state (see [resource_identity_and_api.md](resource_identity_and_api.md#extension-representations) and [resource_indexing.md](resource_indexing.md#resource-identity-and-child-resources)). An extension resource with a non-empty, still-pending alias set is included as a representation exactly like one reporting no aliases at all. This was a deliberate scope decision made in review of the "Simplify Inventory Write Path" plan (see the `inventory-identity-reconciliation` POC's README for the fuller reconciliation-queue model that was considered and not built) to avoid growing this iteration's scope, not a judgment that pending and accepted identity are equivalent.
+
+**Candidate directions, none decided:**
+
+- Add a state field to `domain.ResourceRepresentation` (or a parallel query) computed from whether `reported_aliases` is empty, matches an already-accepted alias set, or conflicts with one -- requires the accepted-alias-set concept to exist for reported (not just directly-asserted) aliases first, which it doesn't yet.
+- Leave representation reads as a pure existence check and expose identity state only through a separate, opt-in read (e.g. alongside the eventual asynchronous reconciler's output) so the common-case read stays cheap.
+- Do nothing until asynchronous reconciliation is actually built, since a "pending" state with no reconciler to ever resolve it out of pending is not obviously more useful than the current binary check.
+
+### Alias write path's shared prepared statement and Postgres's generic-plan switch
+
+> [!NOTE]
+> The specific `aliasFoldCTEs`/`aliasRetractAbsentCTE` write path this question was raised against no longer exists: the "Simplify Inventory Write Path" plan removed synchronous cross-resource alias conflict detection from `ReplaceInventory`/`ApplyInventoryDeltas` entirely, replacing it with an unconditional pending-payload write to `extension_resources.reported_aliases` (see [resource_identity_and_api.md](resource_identity_and_api.md#reported-aliases-inventory-write-path)). The claims/contributions write path this question describes survives only for aliases asserted directly on a `PlatformResource` (`reconcileAliases`), which is a much simpler per-alias loop, not a batched CTE with the kind of wide cost-estimate swing described below. The underlying Postgres generic-plan-switch risk is still worth keeping in mind if a future asynchronous reconciler reintroduces a similarly-shaped batched CTE over `resource_alias_claims`/`resource_alias_contributions`, so the history is kept here rather than deleted.
+
+**Question:** Should the Postgres alias write path (`ReplaceInventory`/`ApplyInventoryDeltas`'s `aliasFoldCTEs`-based statements) force a specific `plan_cache_mode` for itself, or otherwise reduce its plan-shape variance, to avoid a bad generic plan settling in?
+
+**Context:** Benchmarking the `resource_alias_claims`/`resource_alias_contributions` write path (see `fleetshift-server/internal/infrastructure/postgres/inventory_bench_test.go`'s `BenchmarkCTE_ReplaceInventory_RetractAlias`) surfaced a real Postgres query-planning cliff: explicit alias retraction at batch=1,000 cost 1,080.7µs/item under default conditions, versus 225.2µs/item with `plan_cache_mode` explicitly forced to `force_custom_plan` on the same connection -- a confirmed, repeatable &#126;4.3x gap, not benchmark noise. Root cause: `database/sql`'s pgx driver defaults to `QueryExecModeCacheStatement`, which prepares `replaceInventorySQL` once per connection and reuses it for every alias-shaped call (no-op, self-replace, retraction, conflict...). Postgres tries a generic (parameter-value-agnostic) plan starting with that prepared statement's 6th execution on a connection, and keeps it if the estimated cost looks close enough to the custom-plan average of the first five. Retraction's own cost estimate in `EXPLAIN` for `deleted_orphan_claims` ranges from 2,006 to 210,489 -- an unusually wide spread that is exactly the shape a generic plan handles worst, since it must pick one plan that's tolerable across that whole range rather than the cheap end most calls actually need. Full numbers and the isolated custom-vs-generic-plan confirmation are in the `inventory-write-path-benchmark` canvas.
+
+**Why this matters beyond the benchmark:** production connections also default to `cache_statement` mode and also call `ReplaceInventory`/`ApplyInventoryDeltas` repeatedly across widely varying alias-report shapes on the same long-lived connection, so any production connection could eventually settle into the same bad generic plan.
+
+**Candidate mitigations, none evaluated in depth or applied yet:**
+
+- Force `plan_cache_mode = force_custom_plan` for just this statement (a targeted, low-risk session/statement-level setting) -- always pays custom-planning cost per call, but avoids ever picking a bad generic plan.
+- Reduce the fold-in's plan-shape variance directly, e.g. restructuring `aliasRetractAbsentCTE`'s refcount cleanup pipeline (`touched_claims` through `deleted_orphan_claims`) so its cost estimate doesn't swing as widely between "nothing to retract" and "large batch retraction."
+- Periodic connection recycling (bounding how long any one connection can ride out a bad generic plan) -- treats the symptom, not the cause, and doesn't help a connection that goes bad early in its life.
+- Accept it as a known, monitored risk (e.g. via `pg_prepared_statements`'s `generic_plans`/`custom_plans` columns) rather than changing the write path.
+
 ## Addon integration and UI
 
 ### UI plugin mechanism

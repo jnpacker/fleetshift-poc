@@ -1,12 +1,12 @@
 package domain
 
 import (
-	"database/sql/driver"
 	"fmt"
+	"iter"
+	"slices"
+	"sort"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // ServiceName identifies the extension service that owns a representation
@@ -163,46 +163,6 @@ func (s ServiceName) FullName(name ResourceName) FullResourceName {
 // "//{service}/{relative_name}" (e.g. "//kind.fleetshift.io/clusters/prod").
 type FullResourceName string
 
-// PlatformResourceUID is the opaque, stable identifier for a platform
-// resource. Generated once at claim time and never changes. The
-// underlying type is [uuid.UUID] so structural validity is encoded
-// in the type system.
-type PlatformResourceUID uuid.UUID
-
-// NewPlatformResourceUID generates a new random [PlatformResourceUID].
-func NewPlatformResourceUID() PlatformResourceUID {
-	return PlatformResourceUID(uuid.New())
-}
-
-// ParsePlatformResourceUID parses a string into a [PlatformResourceUID].
-func ParsePlatformResourceUID(s string) (PlatformResourceUID, error) {
-	u, err := uuid.Parse(s)
-	if err != nil {
-		return PlatformResourceUID{}, fmt.Errorf("platform resource uid: %w", err)
-	}
-	return PlatformResourceUID(u), nil
-}
-
-// String returns the canonical UUID string representation.
-func (u PlatformResourceUID) String() string { return uuid.UUID(u).String() }
-
-// MarshalText implements [encoding.TextMarshaler] for JSON string encoding.
-func (u PlatformResourceUID) MarshalText() ([]byte, error) { return uuid.UUID(u).MarshalText() }
-
-// UnmarshalText implements [encoding.TextUnmarshaler] for JSON string decoding.
-func (u *PlatformResourceUID) UnmarshalText(data []byte) error {
-	return (*uuid.UUID)(u).UnmarshalText(data)
-}
-
-// Value implements [driver.Valuer] for SQL persistence.
-func (u PlatformResourceUID) Value() (driver.Value, error) { return uuid.UUID(u).String(), nil }
-
-// Scan implements [sql.Scanner] for SQL hydration.
-func (u *PlatformResourceUID) Scan(src any) error { return (*uuid.UUID)(u).Scan(src) }
-
-// IsZero returns true when the UID is the zero (nil) UUID.
-func (u PlatformResourceUID) IsZero() bool { return uuid.UUID(u) == uuid.Nil }
-
 // AliasNamespace scopes an alias key-space (e.g. "gcp", "aws").
 type AliasNamespace string
 
@@ -234,9 +194,9 @@ func NewRelationshipType(s string) (RelationshipType, error) {
 //
 // Construct with [NewAlias] to enforce invariants.
 type Alias struct {
-	Namespace AliasNamespace
-	Key       AliasKey
-	Value     AliasValue
+	namespace AliasNamespace
+	key       AliasKey
+	value     AliasValue
 }
 
 // NewAlias validates and returns an [Alias]. All three fields must be
@@ -251,11 +211,153 @@ func NewAlias(ns AliasNamespace, key AliasKey, value AliasValue) (Alias, error) 
 	if value == "" {
 		return Alias{}, fmt.Errorf("alias value: %w: must not be empty", ErrInvalidArgument)
 	}
-	return Alias{Namespace: ns, Key: key, Value: value}, nil
+	return Alias{namespace: ns, key: key, value: value}, nil
+}
+
+// Namespace returns the alias namespace.
+func (a Alias) Namespace() AliasNamespace { return a.namespace }
+
+// Key returns the alias key within its namespace.
+func (a Alias) Key() AliasKey { return a.key }
+
+// Value returns the alias value.
+func (a Alias) Value() AliasValue { return a.value }
+
+func aliasLess(a, b Alias) bool {
+	if a.namespace != b.namespace {
+		return a.namespace < b.namespace
+	}
+	if a.key != b.key {
+		return a.key < b.key
+	}
+	return a.value < b.value
+}
+
+// AliasSet encapsulates a canonical alias collection. Construction
+// merges by (namespace, key), with later entries winning, and sorts the
+// result deterministically by (namespace, key, value).
+//
+// The zero value is the empty set.
+type AliasSet struct {
+	aliases []Alias
+}
+
+// NewAliasSet canonicalizes aliases into an [AliasSet]. Duplicates are
+// merged by (namespace, key), with the last value winning.
+func NewAliasSet(aliases []Alias) AliasSet {
+	if len(aliases) == 0 {
+		return AliasSet{}
+	}
+	byRef := make(map[AliasRef]Alias, len(aliases))
+	for _, alias := range aliases {
+		byRef[AliasRef{Namespace: alias.namespace, Key: alias.key}] = alias
+	}
+	merged := make([]Alias, 0, len(byRef))
+	for _, alias := range byRef {
+		merged = append(merged, alias)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return aliasLess(merged[i], merged[j])
+	})
+	return AliasSet{aliases: merged}
+}
+
+// Len returns the number of aliases in the set.
+func (s AliasSet) Len() int { return len(s.aliases) }
+
+// Slice returns a copy of the set's aliases in canonical order.
+func (s AliasSet) Slice() []Alias { return slices.Clone(s.aliases) }
+
+// All iterates aliases in canonical order.
+func (s AliasSet) All() iter.Seq[Alias] {
+	return func(yield func(Alias) bool) {
+		for _, alias := range s.aliases {
+			if !yield(alias) {
+				return
+			}
+		}
+	}
+}
+
+// Get returns the alias for ref, if present.
+func (s AliasSet) Get(ref AliasRef) (Alias, bool) {
+	for _, alias := range s.aliases {
+		if alias.namespace == ref.Namespace && alias.key == ref.Key {
+			return alias, true
+		}
+	}
+	return Alias{}, false
+}
+
+// Merge overlays upserts onto s by (namespace, key), returning a new
+// canonical set. This is the merge [InventoryDelta.UpsertAliases]
+// documents.
+func (s AliasSet) Merge(upserts AliasSet) AliasSet {
+	if len(upserts.aliases) == 0 {
+		return s
+	}
+	if len(s.aliases) == 0 {
+		return upserts
+	}
+	merged := make([]Alias, 0, len(s.aliases)+len(upserts.aliases))
+	merged = append(merged, s.aliases...)
+	merged = append(merged, upserts.aliases...)
+	return NewAliasSet(merged)
+}
+
+// Equal reports whether two alias sets contain the same canonical
+// aliases.
+func (s AliasSet) Equal(other AliasSet) bool {
+	if len(s.aliases) != len(other.aliases) {
+		return false
+	}
+	for i := range s.aliases {
+		if s.aliases[i] != other.aliases[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// AliasRef identifies one of an extension resource's own previously
+// reported aliases for removal (see [InventoryDelta.DeleteAliases]), by
+// (namespace, key) alone -- no value. A single extension resource's
+// own reported alias set never holds two different values for the
+// same (namespace, key) at once, so (namespace, key) alone
+// unambiguously identifies which of its own reported aliases to
+// retract -- the same way [InventoryDelta.DeleteLabels] identifies a
+// label to remove by key alone, with no need for its current value.
+//
+// Construct with [NewAliasRef] to enforce invariants.
+type AliasRef struct {
+	Namespace AliasNamespace
+	Key       AliasKey
+}
+
+// NewAliasRef validates and returns an [AliasRef]. Both fields must be
+// non-empty.
+func NewAliasRef(ns AliasNamespace, key AliasKey) (AliasRef, error) {
+	if ns == "" {
+		return AliasRef{}, fmt.Errorf("alias namespace: %w: must not be empty", ErrInvalidArgument)
+	}
+	if key == "" {
+		return AliasRef{}, fmt.Errorf("alias key: %w: must not be empty", ErrInvalidArgument)
+	}
+	return AliasRef{Namespace: ns, Key: key}, nil
 }
 
 // NewResourceName constructs a [ResourceName] from a collection and
-// resource ID.
+// resource ID. Like [NewCollectionName]/[NewResourceID] and every
+// other typed-parts constructor in this file, it trusts that its
+// arguments are already valid instances of their type rather than
+// re-checking invariants [ParseResourceName] already enforces on a
+// raw string (e.g. collection non-empty): once a caller holds a
+// genuine [CollectionName], it was already validated non-empty by
+// whatever produced it ([NewCollectionName] or [ParseCollectionName]),
+// so re-validating here would just be the same check performed twice.
+// A [ResourceName] built by casting a raw string directly, bypassing
+// every constructor, is a caller bug -- see [ParseResourceName]'s doc
+// -- not a case this function defends against.
 func NewResourceName(collection CollectionName, id ResourceID) (ResourceName, error) {
 	return ResourceName(string(collection) + "/" + string(id)), nil
 }
@@ -264,7 +366,18 @@ func NewResourceName(collection CollectionName, id ResourceID) (ResourceName, er
 // It validates that the string contains no leading/trailing/double
 // slashes and has an even number of segments (resource names alternate
 // collection / resource-id, e.g. "clusters/prod" or
-// "publishers/123/books/les-mis").
+// "publishers/123/books/les-mis") -- which also rules out a bare,
+// collection-less name like "prod" (one segment, no "/" at all).
+// AIP-122 itself only says name segments "should usually alternate"
+// between collection and resource-id, but this codebase reads that as
+// a hard requirement: every [ResourceName] has at least one collection
+// segment. This is the only place that requirement is checked --
+// per this codebase's "parse, don't validate" convention, nothing
+// downstream re-validates a [ResourceName] it already holds; a value
+// produced any other way than through this function (or through
+// domain code that itself upholds the invariant, e.g.
+// [NewResourceName]) is a caller bug, most likely a raw string cast
+// in a test, not a state well-typed code needs to defend against.
 func ParseResourceName(s string) (ResourceName, error) {
 	parts, err := validateCanonicalPath("resource name", s)
 	if err != nil {
@@ -283,7 +396,10 @@ func (n ResourceName) FullName(service ServiceName) FullResourceName {
 }
 
 // Collection returns the full collection path (everything before the
-// final ID segment).
+// final ID segment). It returns "" if n has no "/" at all, but that
+// is not a well-formed [ResourceName] -- see [ParseResourceName]'s
+// doc -- so this is a defensive fallback for malformed input, not an
+// endorsement of collection-less names as valid.
 func (n ResourceName) Collection() CollectionName {
 	s := string(n)
 	idx := strings.LastIndex(s, "/")
@@ -343,40 +459,46 @@ func (n FullResourceName) ResourceName() ResourceName {
 // in the fleet. It aggregates representations from multiple extension
 // services, aliases, and relationships.
 //
+// Representations are not owned/mutated by this aggregate: they are
+// derived on read by the repository (joining extension resources on
+// name) and only ever populated here via [PlatformResourceFromSnapshot]
+// for display. Aliases and relationships remain aggregate-owned.
+//
 // Construct new instances with [NewPlatformResource]; reconstitute from
 // persistence with [PlatformResourceFromSnapshot]. Mutate via domain
-// methods ([PlatformResource.SetLabels], [PlatformResource.AttachRepresentation],
+// methods ([PlatformResource.SetLabels], [PlatformResource.AddAlias],
 // etc.). Read via accessor methods.
 type PlatformResource struct {
-	uid       PlatformResourceUID
 	name      ResourceName
 	labels    map[string]string
 	createdAt time.Time
 	updatedAt time.Time
 
 	representations []ResourceRepresentation
-	aliases         []Alias
+	aliases         AliasSet
 	relationships   []ResourceRelationship
 }
 
 // NewPlatformResource creates a brand-new [PlatformResource]. Use this
 // on creation paths; use [PlatformResourceFromSnapshot] only for
 // reconstituting from persistence.
-func NewPlatformResource(uid PlatformResourceUID, name ResourceName, labels map[string]string, now time.Time) *PlatformResource {
+//
+// A platform resource has no UID of its own -- per AIP-148, a UID is
+// only warranted when a resource can be deleted and recreated under
+// the same name yet needs to be distinguished across that gap.
+// Platform resources have no such generational concept: [ResourceName]
+// is the sole, permanent identifier.
+func NewPlatformResource(name ResourceName, labels map[string]string, now time.Time) *PlatformResource {
 	if labels == nil {
 		labels = map[string]string{}
 	}
 	return &PlatformResource{
-		uid:       uid,
 		name:      name,
 		labels:    labels,
 		createdAt: now,
 		updatedAt: now,
 	}
 }
-
-// UID returns the platform resource's stable unique identifier.
-func (r *PlatformResource) UID() PlatformResourceUID { return r.uid }
 
 // Collection returns the collection this resource belongs to,
 // derived from its [ResourceName].
@@ -407,26 +529,17 @@ func (r *PlatformResource) SetLabels(labels map[string]string, now time.Time) {
 // Child entity accessors
 // ---------------------------------------------------------------------------
 
-// Representations returns the active (non-deleted) representations.
+// Representations returns this platform resource's derived
+// representations, as populated by repository read paths such as
+// [ResourceIdentityRepository.GetByName] and
+// [ResourceIdentityRepository.ListByCollection]. Empty unless the
+// aggregate was hydrated by a repository read that populates them.
 func (r *PlatformResource) Representations() []ResourceRepresentation {
-	var active []ResourceRepresentation
-	for _, rep := range r.representations {
-		if rep.deleted {
-			continue
-		}
-		active = append(active, rep)
-	}
-	return active
-}
-
-// AllRepresentations returns all representations including deleted
-// ones.
-func (r *PlatformResource) AllRepresentations() []ResourceRepresentation {
 	return r.representations
 }
 
 // Aliases returns the aliases attached to this platform resource.
-func (r *PlatformResource) Aliases() []Alias {
+func (r *PlatformResource) Aliases() AliasSet {
 	return r.aliases
 }
 
@@ -440,105 +553,39 @@ func (r *PlatformResource) Relationships() []ResourceRelationship {
 // Aggregate mutation methods
 // ---------------------------------------------------------------------------
 
-// AttachRepresentationInput is the input for
-// [PlatformResource.AttachRepresentation].
-//
-// Collection and Name are not included because the resource name is
-// identity-equivalent across services (see resource_identity_and_api.md).
-// The aggregate stamps them from its own canonical identity.
-type AttachRepresentationInput struct {
-	ServiceName          ServiceName
-	Version              APIVersion
-	ExtensionResourceUID ExtensionResourceUID
-}
-
-// AttachRepresentation adds or updates an extension representation on
-// this platform resource. The representation inherits the aggregate's
-// canonical Collection and Name because the resource name is identity-
-// equivalent across services. It validates that managed+inventory roles
-// are not combined; other value-object invariants are assumed enforced
-// at construction time by callers.
-func (r *PlatformResource) AttachRepresentation(in AttachRepresentationInput, now time.Time) error {
-	rep := ResourceRepresentation{
-		platformUID:          r.uid,
-		serviceName:          in.ServiceName,
-		version:              in.Version,
-		name:                 r.name,
-		extensionResourceUID: in.ExtensionResourceUID,
-		createdAt:            now,
-		updatedAt:            now,
-	}
-
-	for i, existing := range r.representations {
-		if existing.serviceName == in.ServiceName {
-			rep.createdAt = existing.createdAt
-			rep.deleted = false
-			r.representations[i] = rep
-			r.updatedAt = now
-			return nil
-		}
-	}
-
-	r.representations = append(r.representations, rep)
-	r.updatedAt = now
-	return nil
-}
-
-// DeleteRepresentation marks the representation from the given service
-// as deleted. Since the resource name is identity-equivalent across
-// services, the match is by [ServiceName] only. Already-deleted
-// representations are a no-op (idempotent) so that delete retries
-// don't fail on re-entry. Returns [ErrNotFound] if no representation
-// from the service exists at all.
-func (r *PlatformResource) DeleteRepresentation(service ServiceName, now time.Time) error {
-	for i, rep := range r.representations {
-		if rep.serviceName == service {
-			if rep.deleted {
-				return nil
-			}
-			r.representations[i].deleted = true
-			r.representations[i].updatedAt = now
-			r.updatedAt = now
-			return nil
-		}
-	}
-	return fmt.Errorf("representation from %s on %s: %w", service, r.name, ErrNotFound)
-}
-
 // AddAlias appends an alias to the platform resource. Duplicate aliases
 // (same namespace+key+value) are silently ignored (idempotent). An alias
 // whose namespace+key matches an existing alias but with a different
 // value is rejected as an invariant violation. Cross-resource alias
 // uniqueness is enforced by the repository on save.
 func (r *PlatformResource) AddAlias(alias Alias) error {
-	for _, existing := range r.aliases {
-		if existing.Namespace == alias.Namespace && existing.Key == alias.Key {
-			if existing.Value == alias.Value {
-				return nil // idempotent
-			}
-			return fmt.Errorf("alias %s/%s already has value %q, cannot set %q: %w",
-				existing.Namespace, existing.Key, existing.Value, alias.Value, ErrInvalidArgument)
+	ref := AliasRef{Namespace: alias.Namespace(), Key: alias.Key()}
+	if existing, ok := r.aliases.Get(ref); ok {
+		if existing == alias {
+			return nil // idempotent
 		}
+		return fmt.Errorf("alias %s/%s already has value %q, cannot set %q: %w",
+			existing.Namespace(), existing.Key(), existing.Value(), alias.Value(), ErrInvalidArgument)
 	}
-	r.aliases = append(r.aliases, alias)
+	r.aliases = r.aliases.Merge(NewAliasSet([]Alias{alias}))
 	return nil
 }
 
 // AddRelationship adds a typed relationship from this platform resource
 // to another. Validates that the relationship type is non-empty and
-// that the source UID matches this aggregate. If a relationship with
-// the same (type, targetUID) already exists, it is updated in place.
+// that the source name matches this aggregate. If a relationship with
+// the same (type, targetName) already exists, it is updated in place.
 func (r *PlatformResource) AddRelationship(rel ResourceRelationship) error {
-	if rel.sourceUID != r.uid {
-		return fmt.Errorf("relationship source UID %q does not match resource UID %q: %w",
-			rel.sourceUID, r.uid, ErrInvalidArgument)
+	if rel.sourceName != r.name {
+		return fmt.Errorf("relationship source name %q does not match resource name %q: %w",
+			rel.sourceName, r.name, ErrInvalidArgument)
 	}
 	if rel.relType == "" {
 		return fmt.Errorf("relationship type: %w: must not be empty", ErrInvalidArgument)
 	}
 
 	for i, existing := range r.relationships {
-		if existing.relType == rel.relType && existing.targetUID == rel.targetUID {
+		if existing.relType == rel.relType && existing.targetName == rel.targetName {
 			r.relationships[i] = rel
 			return nil
 		}
@@ -566,28 +613,28 @@ func (r *PlatformResource) Snapshot() PlatformResourceSnapshot {
 		repSnaps[i] = rep.Snapshot()
 	}
 
-	aliasSnaps := make([]ResourceAliasSnapshot, len(r.aliases))
-	for i, a := range r.aliases {
-		aliasSnaps[i] = ResourceAliasSnapshot{
-			Namespace: a.Namespace,
-			Key:       a.Key,
-			Value:     a.Value,
-		}
+	aliasSnaps := make([]ResourceAliasSnapshot, 0, r.aliases.Len())
+	for alias := range r.aliases.All() {
+		aliasSnap := alias.Snapshot()
+		aliasSnaps = append(aliasSnaps, ResourceAliasSnapshot{
+			Namespace: aliasSnap.Namespace,
+			Key:       aliasSnap.Key,
+			Value:     aliasSnap.Value,
+		})
 	}
 
 	relSnaps := make([]ResourceRelationshipSnapshot, len(r.relationships))
 	for i, rel := range r.relationships {
 		relSnaps[i] = ResourceRelationshipSnapshot{
-			SourceUID:     rel.sourceUID,
+			SourceName:    rel.sourceName,
 			Type:          rel.relType,
-			TargetUID:     rel.targetUID,
+			TargetName:    rel.targetName,
 			SourceService: rel.sourceService,
 			CreatedAt:     rel.createdAt,
 		}
 	}
 
 	return PlatformResourceSnapshot{
-		UID:             r.uid,
 		Name:            r.name,
 		Labels:          r.labels,
 		CreatedAt:       r.createdAt,
@@ -606,15 +653,18 @@ func (r *PlatformResource) Snapshot() PlatformResourceSnapshot {
 // considers a platform resource to exist within its API surface. A
 // single platform resource may have multiple representations (e.g. one
 // from Kind, one from GCP Host Connector).
+//
+// Representations are never persisted directly: the repository derives
+// them on read by joining extension resources to platform resources on
+// name, so a representation appears and disappears exactly when its
+// backing extension resource is created/deleted.
 type ResourceRepresentation struct {
-	platformUID          PlatformResourceUID
 	serviceName          ServiceName
 	version              APIVersion
 	name                 ResourceName
 	extensionResourceUID ExtensionResourceUID
 	createdAt            time.Time
 	updatedAt            time.Time
-	deleted              bool
 }
 
 // FullResourceName returns the full resource name for this
@@ -622,9 +672,6 @@ type ResourceRepresentation struct {
 func (rr ResourceRepresentation) FullResourceName() FullResourceName {
 	return rr.name.FullName(rr.serviceName)
 }
-
-// PlatformUID returns the owning platform resource identifier.
-func (rr ResourceRepresentation) PlatformUID() PlatformResourceUID { return rr.platformUID }
 
 // ServiceName returns the extension service that owns this representation.
 func (rr ResourceRepresentation) ServiceName() ServiceName { return rr.serviceName }
@@ -646,36 +693,28 @@ func (rr ResourceRepresentation) CreatedAt() time.Time { return rr.createdAt }
 // UpdatedAt returns the last-updated timestamp.
 func (rr ResourceRepresentation) UpdatedAt() time.Time { return rr.updatedAt }
 
-// Deleted reports whether this representation has been marked deleted
-// in the aggregate and should be hard-deleted by the repository.
-func (rr ResourceRepresentation) Deleted() bool { return rr.deleted }
-
 // ResourceRepresentationFromSnapshot constructs a
 // [ResourceRepresentation] from a snapshot.
 func ResourceRepresentationFromSnapshot(s ResourceRepresentationSnapshot) ResourceRepresentation {
 	return ResourceRepresentation{
-		platformUID:          s.PlatformUID,
 		serviceName:          s.ServiceName,
 		version:              s.Version,
 		name:                 s.Name,
 		extensionResourceUID: s.ExtensionResourceUID,
 		createdAt:            s.CreatedAt,
 		updatedAt:            s.UpdatedAt,
-		deleted:              s.Deleted,
 	}
 }
 
 // Snapshot returns a [ResourceRepresentationSnapshot].
 func (rr ResourceRepresentation) Snapshot() ResourceRepresentationSnapshot {
 	return ResourceRepresentationSnapshot{
-		PlatformUID:          rr.platformUID,
 		ServiceName:          rr.serviceName,
 		Version:              rr.version,
 		Name:                 rr.name,
 		ExtensionResourceUID: rr.extensionResourceUID,
 		CreatedAt:            rr.createdAt,
 		UpdatedAt:            rr.updatedAt,
-		Deleted:              rr.deleted,
 	}
 }
 
@@ -685,18 +724,13 @@ func (rr ResourceRepresentation) Snapshot() ResourceRepresentationSnapshot {
 
 // ResourceRelationship records a directed relationship from one
 // platform resource to another, reported by a particular extension
-// service.
-//
-// TODO: Relationships currently reference resources by UID. Resource
-// names ([ResourceName]) are stable, human-readable, and the canonical
-// AIP reference mechanism. UIDs force an extra lookup to understand
-// what a relationship points to. Consider switching to names, possibly
-// with deferred resolution for cases where the target resource doesn't
-// exist yet.
+// service. Resources are referenced by [ResourceName] -- stable,
+// human-readable, and the canonical AIP reference mechanism -- rather
+// than by UID, since platform resources have none.
 type ResourceRelationship struct {
-	sourceUID     PlatformResourceUID
+	sourceName    ResourceName
 	relType       RelationshipType
-	targetUID     PlatformResourceUID
+	targetName    ResourceName
 	sourceService ServiceName
 	createdAt     time.Time
 }
@@ -705,29 +739,29 @@ type ResourceRelationship struct {
 // Aggregate-level invariants are enforced by
 // [PlatformResource.AddRelationship].
 func NewResourceRelationship(
-	sourceUID PlatformResourceUID,
+	sourceName ResourceName,
 	relType RelationshipType,
-	targetUID PlatformResourceUID,
+	targetName ResourceName,
 	sourceService ServiceName,
 	createdAt time.Time,
 ) ResourceRelationship {
 	return ResourceRelationship{
-		sourceUID:     sourceUID,
+		sourceName:    sourceName,
 		relType:       relType,
-		targetUID:     targetUID,
+		targetName:    targetName,
 		sourceService: sourceService,
 		createdAt:     createdAt,
 	}
 }
 
-// SourceUID returns the source platform resource UID.
-func (rr ResourceRelationship) SourceUID() PlatformResourceUID { return rr.sourceUID }
+// SourceName returns the source platform resource name.
+func (rr ResourceRelationship) SourceName() ResourceName { return rr.sourceName }
 
 // Type returns the relationship type.
 func (rr ResourceRelationship) Type() RelationshipType { return rr.relType }
 
-// TargetUID returns the target platform resource UID.
-func (rr ResourceRelationship) TargetUID() PlatformResourceUID { return rr.targetUID }
+// TargetName returns the target platform resource name.
+func (rr ResourceRelationship) TargetName() ResourceName { return rr.targetName }
 
 // SourceService returns the extension service that reported the relationship.
 func (rr ResourceRelationship) SourceService() ServiceName { return rr.sourceService }
@@ -739,9 +773,9 @@ func (rr ResourceRelationship) CreatedAt() time.Time { return rr.createdAt }
 // from a snapshot.
 func ResourceRelationshipFromSnapshot(s ResourceRelationshipSnapshot) ResourceRelationship {
 	return ResourceRelationship{
-		sourceUID:     s.SourceUID,
+		sourceName:    s.SourceName,
 		relType:       s.Type,
-		targetUID:     s.TargetUID,
+		targetName:    s.TargetName,
 		sourceService: s.SourceService,
 		createdAt:     s.CreatedAt,
 	}

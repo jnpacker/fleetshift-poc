@@ -341,7 +341,9 @@ CREATE TABLE condition_events (
 );
 ```
 
-Same pattern applies for inventory condition events.
+Currently, conditions are part of the inventory model (implied by being a managed resource).
+
+TODO: Reconcile between delivery conditions and inventoried conditions?
 
 ### Inventory
 
@@ -358,7 +360,7 @@ Each inventory item has:
 - **Observations**: opaque, addon-defined. The latest point-in-time report of runtime state (replica counts, image versions, allocatable resources, etc.) as seen by the observer. Historical observations are kept over time.
 - **Conditions**: structured, platform-queryable health and progress signals. Historical transitions tracked via condition events. Gives the platform a uniform health query surface across all resource types without understanding observation internals.
 
-Aliases and semantic relationships live on the linked platform resource identity. Inventory reporting may contribute them, but the platform resource remains the canonical owner of that aggregated identity data.
+Aliases and semantic relationships live on the linked platform resource identity. Inventory reporting may contribute them, but the platform resource remains the canonical owner of that aggregated, *accepted* identity data. A reported alias set is stored as a pending assertion on the extension resource immediately; there is no synchronous check against other reports and no synchronous promotion into the platform resource's aggregated set -- that acceptance/conflict step is future asynchronous reconciliation work.
 
 For managed resources, the managed thing itself may have an inventory projection. A single intent may explode into many inventory items — the managed resource's own projection plus sub-resources created by the addon (nodes under a cluster, operators, etc.). Side-effect resources associate with the delivery but have no manifest_key.
 
@@ -373,7 +375,7 @@ The managed resource consumer API projects from three sources:
 - **Spec** → `resource_intents` (the version the managed resource tracks). The user's declared intent.
 - **State** → Fulfillment lifecycle enum (PROVISIONING, ACTIVE, FAILED, DELETING). The AIP-compliant lifecycle state.
 - **Properties** → inventory item for this managed resource (if present). Stable generated values (api_url, provider_id, console_url). Written once, rarely change, no history needed. Lives on the inventory item because a single Fulfillment can fan out to many objects, each with its own properties.
-- **Observations** → inventory item for this managed resource (if present). The latest point-in-time report of what the observer saw. Historical observations are kept over time.
+- **Observations** → inventory item for this managed resource (if present). The latest point-in-time report of what the observer saw.
 - **Conditions** → always from Fulfillment (aggregated from delivery conditions via CEL), plus inventory conditions for this managed resource if a matching inventory item exists. Fulfillment conditions are always available because every managed resource has a Fulfillment; they provide the operational/management view ("is the delivery pipeline working?"). Inventory conditions, when present, add resource-health signals ("is the resource itself healthy?"). Both are merged into a single conditions list — condition types are self-describing, so the consumer doesn't need to distinguish the source.
 
 ```
