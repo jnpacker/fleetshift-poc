@@ -204,10 +204,31 @@ CREATE TABLE extension_resources (
         REFERENCES extension_resource_types(service_name, type_name)
 );
 
--- Supports deriving representations for a platform resource: join on
--- (collection_name, resource_id) rather than service_name-prefixed.
-CREATE INDEX idx_extension_resources_collection_resource
-    ON extension_resources(collection_name, resource_id);
+-- QueryResources default order groups by logical resource identity
+-- first (collection_name, resource_id), then by addon type
+-- (service_name, type_name). This composite also covers the former
+-- (collection_name, resource_id) representation-join lookup as a left
+-- prefix, so the narrower idx_extension_resources_collection_resource
+-- is no longer needed.
+CREATE INDEX idx_extension_resources_query_order
+    ON extension_resources(collection_name, resource_id, service_name, type_name);
+
+-- QueryResources "resource_type,name" order mode, and the
+-- resource_type == "service/Type" equality rewrite that compiles to
+-- service_name/type_name constituent predicates (see
+-- ../query_filter.go). Replaces the previous expression index on
+-- (service_name || '/' || type_name).
+CREATE INDEX idx_extension_resources_type_query_order
+    ON extension_resources(service_name, type_name, collection_name, resource_id);
+
+-- GIN on extension resource labels so resource.labels["k"] == "v"
+-- can use JSONB containment (@>) after the field resolver's equality
+-- rewrite (see ../query_filter.go). jsonb_path_ops is smaller and more
+-- selective for @> than the default jsonb_ops; we don't need key-
+-- existence operators (?, ?|, ?&). Inventory labels/conditions keep
+-- their own jsonb_path_ops GIN indexes below.
+CREATE INDEX idx_extension_resources_labels_gin
+    ON extension_resources USING GIN (labels jsonb_path_ops);
 
 -- Aliases split into two tables, per the validated
 -- poc/alias-claims/ prototype -- see
@@ -364,13 +385,13 @@ CREATE TABLE resource_intents (
 -- set/upsert-plus-delete semantics map directly onto the `-`
 -- (key-removal) and `||` (merge) jsonb operators (see
 -- extension_resource_repo.go's applyInventoryDeltasCoreCTEs). The GIN
--- indexes below support future containment/key-existence label and
--- condition search over that latest state; jsonb_ops is the default
--- opclass, chosen because it's the more general one and real query
--- shapes aren't known yet -- jsonb_path_ops could be revisited if a
--- containment-only workload emerges. SQLite's mirror of this table
--- (see that migration) has no equivalent index today; see that
--- file's own doc comment.
+-- indexes below support containment (@>) label and condition search
+-- over that latest state via the field resolver's equality rewrite
+-- (see ../query_filter.go). jsonb_path_ops is preferred over the
+-- default jsonb_ops: QueryResources only emits @> for these maps, and
+-- path_ops is smaller and more selective for that operator. SQLite's
+-- mirror of this table (see that migration) has no equivalent index
+-- today; see that file's own doc comment.
 --
 -- conditions is a JSON object keyed by condition type (not an array)
 -- so a delta's per-type upsert/delete can use the same key-removal/
@@ -399,10 +420,10 @@ CREATE TABLE extension_resource_inventory (
 );
 
 CREATE INDEX extension_resource_inventory_labels_gin
-    ON extension_resource_inventory USING GIN (labels);
+    ON extension_resource_inventory USING GIN (labels jsonb_path_ops);
 
 CREATE INDEX extension_resource_inventory_conditions_gin
-    ON extension_resource_inventory USING GIN (conditions);
+    ON extension_resource_inventory USING GIN (conditions jsonb_path_ops);
 
 CREATE TABLE extension_resource_inventory_condition_events (
     id                     TEXT PRIMARY KEY,

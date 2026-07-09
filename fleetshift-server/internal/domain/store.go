@@ -38,6 +38,11 @@ type Tx interface {
 	ExtensionResources() ExtensionResourceRepository
 	SignerEnrollments() SignerEnrollmentRepository
 	ResourceIdentities() ResourceIdentityRepository
+	// Queries provides the read model query surface over extension
+	// resources. See [QueryRepository]'s doc for why this is not
+	// grouped with the aggregate repositories above, and for the
+	// deferred status of platform aggregate search.
+	Queries() QueryRepository
 	Commit() error
 	Rollback() error
 }

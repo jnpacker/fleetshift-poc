@@ -117,13 +117,20 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		authMethodRepo domain.AuthMethodRepository
 	)
 
+	// activeResources backs QueryRepository's optional type-specific
+	// field validation and DynamicSchemaActivator's activation state
+	// (see [domain.QuerySchemaProvider] and
+	// [managedresource.ActiveResourceRegistry]). It starts empty and is
+	// populated as managed resource schemas are activated below.
+	activeResources := managedresource.NewActiveResourceRegistry()
+
 	if f.databaseURL != "" {
 		var err error
 		db, err = pgstore.Open(f.databaseURL)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
-		store = &pgstore.Store{DB: db}
+		store = &pgstore.Store{DB: db, SchemaProvider: activeResources}
 		vault = &pgstore.VaultStore{DB: db}
 		authMethodRepo = &pgstore.AuthMethodRepo{DB: db}
 	} else {
@@ -586,6 +593,7 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		PlatformDeps: platformresource.Deps{
 			Resources: platformResourceSvc,
 		},
+		Registry: activeResources,
 	}
 	addonMgr := application.NewAddonManager(application.AddonManagerDeps{
 		Router:    router,

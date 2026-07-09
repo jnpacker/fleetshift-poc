@@ -3,9 +3,11 @@ package managedresource_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,8 +45,9 @@ func newActivator(t *testing.T) (*managedresource.DynamicSchemaActivator, *dynam
 		t.Fatalf("protovalidate.New: %v", err)
 	}
 	return &managedresource.DynamicSchemaActivator{
-		GRPCMux: mux,
-		Deps:    managedresource.Deps{Validator: validator},
+		GRPCMux:  mux,
+		Deps:     managedresource.Deps{Validator: validator},
+		Registry: managedresource.NewActiveResourceRegistry(),
 	}, mux
 }
 
@@ -100,9 +103,10 @@ func newActivatorWithHTTP(t *testing.T) activatorHTTPEnv {
 
 	return activatorHTTPEnv{
 		activator: &managedresource.DynamicSchemaActivator{
-			GRPCMux: grpcMux,
-			HTTPMux: httpMux,
-			Deps:    managedresource.Deps{Validator: validator},
+			GRPCMux:  grpcMux,
+			HTTPMux:  httpMux,
+			Deps:     managedresource.Deps{Validator: validator},
+			Registry: managedresource.NewActiveResourceRegistry(),
 		},
 		grpcMux: grpcMux,
 		httpMux: httpMux,
@@ -166,6 +170,59 @@ func TestDynamicSchemaActivator_DeactivateRemovesService(t *testing.T) {
 	}
 }
 
+// TestDynamicSchemaActivator_ActivateRegistersQuerySchema proves that
+// Activate records its compiled spec descriptor in Registry (see
+// the QueryRepository POC plan's "Schema Provider" section) and that
+// Deactivate removes it again.
+func TestDynamicSchemaActivator_ActivateRegistersQuerySchema(t *testing.T) {
+	activator, _ := newActivator(t)
+
+	schema := kindaddon.Schema()
+	id, err := activator.Activate(context.Background(), schema)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	got, ok, err := activator.Registry.GetResourceQuerySchema(context.Background(), schema.ResourceType)
+	if err != nil || !ok {
+		t.Fatalf("GetResourceQuerySchema after Activate: ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+	if got.SpecDescriptor == nil {
+		t.Error("SpecDescriptor is nil, want the compiled spec descriptor")
+	}
+	if got.SpecDescriptor.FullName() != protoreflect.FullName(schema.Management.SpecMessage) {
+		t.Errorf("SpecDescriptor.FullName() = %q, want %q", got.SpecDescriptor.FullName(), schema.Management.SpecMessage)
+	}
+	if got.APIVersion != domain.APIVersion(schema.Version) {
+		t.Errorf("APIVersion = %q, want %q", got.APIVersion, schema.Version)
+	}
+
+	activator.Deactivate(id)
+
+	if _, ok, err := activator.Registry.GetResourceQuerySchema(context.Background(), schema.ResourceType); err != nil || ok {
+		t.Fatalf("GetResourceQuerySchema after Deactivate: ok=%v err=%v, want ok=false err=nil", ok, err)
+	}
+}
+
+// TestDynamicSchemaActivator_RejectsSecondAPIVersion proves the
+// prototype limitation that only one API version may be active per
+// resource type (see ActiveResourceRegistry.Register).
+func TestDynamicSchemaActivator_RejectsSecondAPIVersion(t *testing.T) {
+	activator, _ := newActivator(t)
+
+	schema := kindaddon.Schema()
+	if _, err := activator.Activate(context.Background(), schema); err != nil {
+		t.Fatalf("Activate v1: %v", err)
+	}
+
+	v2 := schema
+	v2.Version = "v2"
+	_, err := activator.Activate(context.Background(), v2)
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("Activate v2: err = %v, want ErrInvalidArgument", err)
+	}
+}
+
 func TestDynamicSchemaActivator_DuplicateActivateIsIdempotent(t *testing.T) {
 	activator, _ := newActivator(t)
 
@@ -182,6 +239,25 @@ func TestDynamicSchemaActivator_DuplicateActivateIsIdempotent(t *testing.T) {
 
 	if h1 != h2 {
 		t.Errorf("handles differ: %v vs %v", h1, h2)
+	}
+
+	// Unchanged Activate must release its lock; otherwise ContentHash
+	// (and Activate/Deactivate) deadlock on the same activator.
+	type hashResult struct {
+		ok bool
+	}
+	done := make(chan hashResult, 1)
+	go func() {
+		_, ok := activator.ContentHash(string(h2))
+		done <- hashResult{ok: ok}
+	}()
+	select {
+	case r := <-done:
+		if !r.ok {
+			t.Error("expected content hash after unchanged Activate")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ContentHash blocked after unchanged Activate; likely mu not unlocked on fast path")
 	}
 }
 
@@ -372,46 +448,161 @@ func TestDynamicSchemaActivator_ChangedContentSwapsHTTPRoutes(t *testing.T) {
 	}
 }
 
-func TestDynamicSchemaActivator_ReplaceWithChangedHTTPIdentity(t *testing.T) {
+// TestDynamicSchemaActivator_HTTPPrefixAfterTypeSwap matches the
+// production AddonManager lifecycle when a resource type is replaced:
+// deactivate the old activation, then activate the new type (same
+// ProtoPackage/Singular → same gRPC name, different HTTP prefix).
+// Asserts the old prefix is gone and the new handler trims correctly.
+func TestDynamicSchemaActivator_HTTPPrefixAfterTypeSwap(t *testing.T) {
 	env := newActivatorWithHTTP(t)
 
-	schema := kindaddon.Schema()
-	_, err := env.activator.Activate(context.Background(), schema)
+	oldSchema := kindaddon.Schema()
+	oldID, err := env.activator.Activate(context.Background(), oldSchema)
 	if err != nil {
-		t.Fatalf("Activate v1: %v", err)
+		t.Fatalf("Activate old: %v", err)
 	}
 
 	oldPrefix := "/apis/kind.fleetshift.io/v1/clusters"
-	code := httpStatus(t, env.httpURL+oldPrefix+"/test-id")
-	if code == http.StatusNotFound {
-		t.Fatal("expected old canonical route to exist after first Activate, got 404")
+	if code := httpStatus(t, env.httpURL+oldPrefix+"/test-id"); code == http.StatusNotFound {
+		t.Fatal("expected old canonical route after Activate, got 404")
 	}
 
-	// Change the service name (via ResourceType) and thus the HTTP
-	// prefix, while keeping the same gRPC service name. This simulates
-	// a transport identity change that previously leaked the old HTTP
-	// route.
-	schema.ResourceType = "kindv2.fleetshift.io/Cluster"
-	schema.ProtoFiles = map[string]string{
+	env.activator.Deactivate(oldID)
+
+	if code := httpStatus(t, env.httpURL+oldPrefix+"/test-id"); code != http.StatusNotFound {
+		t.Fatalf("expected old prefix gone after Deactivate, got %d", code)
+	}
+
+	newSchema := kindaddon.Schema()
+	newSchema.ResourceType = "kindv2.fleetshift.io/Cluster"
+	newSchema.ProtoFiles = map[string]string{
 		"cluster_spec.proto": `syntax = "proto3"; message KindClusterSpecV2 { string name = 1; }`,
 	}
-	schema.EntryFile = "cluster_spec.proto"
-	schema.Management.SpecMessage = "KindClusterSpecV2"
+	newSchema.EntryFile = "cluster_spec.proto"
+	newSchema.Management.SpecMessage = "KindClusterSpecV2"
 
-	_, err = env.activator.Activate(context.Background(), schema)
-	if err != nil {
-		t.Fatalf("Activate v2: %v", err)
+	if _, err := env.activator.Activate(context.Background(), newSchema); err != nil {
+		t.Fatalf("Activate new: %v", err)
 	}
 
 	newPrefix := "/apis/kindv2.fleetshift.io/v1/clusters"
-	newCode := httpStatus(t, env.httpURL+newPrefix+"/test-id")
-	if newCode == http.StatusNotFound {
-		t.Fatal("expected new canonical route to be routable after replace, got 404")
+	newURL := env.httpURL + newPrefix + "/test-id"
+	resp, err := http.Get(newURL)
+	if err != nil {
+		t.Fatalf("GET %s: %v", newURL, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		t.Fatal("expected new canonical route after Activate, got 404")
+	}
+	// BuildHTTPHandler must trim the new prefix. Trimming the old one
+	// would leave a path fragment in the ID → InvalidArgument (400).
+	if resp.StatusCode == http.StatusBadRequest {
+		t.Fatalf("GET after type swap returned 400 (likely trimmed wrong prefix); body=%s", body)
+	}
+	if strings.Contains(string(body), "apis/kindv2.fleetshift.io") {
+		t.Fatalf("error body still contains untrimmed HTTP path: %s", body)
 	}
 
-	oldCode := httpStatus(t, env.httpURL+oldPrefix+"/test-id")
-	if oldCode != http.StatusNotFound {
-		t.Errorf("expected old canonical route to return 404 after replace, got %d", oldCode)
+	if code := httpStatus(t, env.httpURL+oldPrefix+"/test-id"); code != http.StatusNotFound {
+		t.Errorf("expected old prefix still absent after new Activate, got %d", code)
+	}
+}
+
+// TestDynamicSchemaActivator_PackageRenameKeepsOldOnFailure proves that
+// when the gRPC service name changes, a failure registering the new
+// transport leaves the previous registration intact (atomic replace).
+func TestDynamicSchemaActivator_PackageRenameKeepsOldOnFailure(t *testing.T) {
+	activator, mux := newActivator(t)
+
+	schema := kindaddon.Schema()
+	oldID, err := activator.Activate(context.Background(), schema)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	oldService := string(oldID)
+
+	// Occupy the destination gRPC name so RegisterDesc for the renamed
+	// package fails after Activate has decided to move.
+	newService := "kind.fleetshift.v2.ClusterService"
+	if err := mux.RegisterDesc(&grpc.ServiceDesc{ServiceName: newService}); err != nil {
+		t.Fatalf("pre-register conflicting service: %v", err)
+	}
+
+	schema.ProtoPackage = "kind.fleetshift.v2"
+	_, err = activator.Activate(context.Background(), schema)
+	if err == nil {
+		t.Fatal("Activate with conflicting new gRPC name: want error")
+	}
+
+	info := mux.ServiceInfo()
+	if _, ok := info[oldService]; !ok {
+		t.Fatalf("old service %q missing from mux after failed rename; atomic replace must keep it", oldService)
+	}
+	_, ver, ok := activator.Registry.GetByGRPCServiceName(oldService)
+	if !ok {
+		t.Fatal("old gRPC registration missing from registry after failed rename")
+	}
+	if ver.GRPCServiceName != oldService {
+		t.Errorf("registry GRPCServiceName = %q, want %q", ver.GRPCServiceName, oldService)
+	}
+	if _, _, ok := activator.Registry.GetByGRPCServiceName(newService); ok {
+		t.Error("failed rename must not leave the new gRPC name in the registry")
+	}
+}
+
+// TestDynamicSchemaActivator_PackageRenameSameHTTPPrefix proves that a
+// ProtoPackage rename (new gRPC name, unchanged canonical HTTP prefix)
+// succeeds with HTTPMux wired: the shared prefix is replaced in place
+// rather than re-registered, the old gRPC identity is retired, and the
+// HTTP route stays live.
+func TestDynamicSchemaActivator_PackageRenameSameHTTPPrefix(t *testing.T) {
+	env := newActivatorWithHTTP(t)
+	ctx := context.Background()
+
+	schema := kindaddon.Schema()
+	oldID, err := env.activator.Activate(ctx, schema)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	oldService := string(oldID)
+	const prefix = "/apis/kind.fleetshift.io/v1/clusters"
+
+	if code := httpStatus(t, env.httpURL+prefix+"/test-id"); code == http.StatusNotFound {
+		t.Fatal("expected canonical route after first Activate, got 404")
+	}
+
+	schema.ProtoPackage = "kind.fleetshift.v2"
+	newID, err := env.activator.Activate(ctx, schema)
+	if err != nil {
+		t.Fatalf("Activate after package rename: %v", err)
+	}
+	newService := string(newID)
+	if newService != "kind.fleetshift.v2.ClusterService" {
+		t.Fatalf("new registration ID = %q, want kind.fleetshift.v2.ClusterService", newService)
+	}
+	if newService == oldService {
+		t.Fatal("expected gRPC service name to change after ProtoPackage rename")
+	}
+
+	info := env.grpcMux.ServiceInfo()
+	if _, ok := info[newService]; !ok {
+		t.Fatalf("expected new service %q in mux after rename", newService)
+	}
+	if _, ok := info[oldService]; ok {
+		t.Fatalf("old service %q still in mux after successful rename", oldService)
+	}
+	if _, _, ok := env.activator.Registry.GetByGRPCServiceName(oldService); ok {
+		t.Fatal("old gRPC name still in registry after successful rename")
+	}
+	if _, _, ok := env.activator.Registry.GetByGRPCServiceName(newService); !ok {
+		t.Fatal("new gRPC name missing from registry after rename")
+	}
+
+	if code := httpStatus(t, env.httpURL+prefix+"/test-id"); code == http.StatusNotFound {
+		t.Fatal("expected canonical route to survive package rename, got 404")
 	}
 }
 
@@ -512,6 +703,7 @@ func newActivatorWithResources(t *testing.T) activatorResourceEnv {
 				Resources: resourceSvc,
 				Validator: validator,
 			},
+			Registry: managedresource.NewActiveResourceRegistry(),
 		},
 		conn:    conn,
 		typeSvc: application.NewExtensionResourceTypeService(store),
@@ -701,6 +893,7 @@ func newActivatorWithPlatform(t *testing.T) (*managedresource.DynamicSchemaActiv
 		GRPCMux:      mux,
 		Deps:         managedresource.Deps{Validator: validator},
 		PlatformDeps: platformresource.Deps{Resources: application.NewPlatformResourceService(store)},
+		Registry:     managedresource.NewActiveResourceRegistry(),
 	}, mux
 }
 
@@ -806,6 +999,51 @@ func TestReplaceDoesNotDropPlatform(t *testing.T) {
 	}
 }
 
+// TestReplaceInPlaceKeepsExtensionOnPlatformAcquireFailure proves that
+// an in-place content replace must reconcile platform ownership before
+// mutating the live extension mux. If acquirePlatform fails, the
+// previously registered extension transport must remain routable.
+func TestReplaceInPlaceKeepsExtensionOnPlatformAcquireFailure(t *testing.T) {
+	env := newActivatorWithHTTPAndPlatform(t)
+	ctx := context.Background()
+	const extSvc = "kind.fleetshift.v1.ClusterService"
+
+	schema := kindaddon.Schema()
+	if _, err := env.activator.Activate(ctx, schema); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	if _, ok := env.grpcMux.ServiceInfo()[extSvc]; !ok {
+		t.Fatal("expected extension service after initial Activate")
+	}
+
+	// Occupy the destination platform HTTP prefix so acquirePlatform
+	// fails after releasing the old collection's platform ownership.
+	const newPlatformPrefix = "/apis/fleetshift.io/v1/widgets"
+	if err := env.httpMux.RegisterPrefixHandler(newPlatformPrefix, func(http.ResponseWriter, *http.Request) {}); err != nil {
+		t.Fatalf("pre-register conflicting platform prefix: %v", err)
+	}
+
+	// Same gRPC service name (replace-in-place), new CollectionID so
+	// platform ownership must be re-acquired.
+	modified := kindaddon.Schema()
+	modified.CollectionID = "widgets"
+	for k, v := range modified.ProtoFiles {
+		modified.ProtoFiles[k] = "// replaced for test\n" + v
+	}
+
+	_, err := env.activator.Activate(ctx, modified)
+	if err == nil {
+		t.Fatal("Activate with conflicting platform prefix: want error")
+	}
+
+	if _, ok := env.grpcMux.ServiceInfo()[extSvc]; !ok {
+		t.Fatalf("extension service %q missing from mux after failed platform acquire; replace-in-place must not tear it down", extSvc)
+	}
+	if _, _, ok := env.activator.Registry.GetByGRPCServiceName(extSvc); !ok {
+		t.Fatal("extension registry entry missing after failed platform acquire")
+	}
+}
+
 func TestPlatformReflection(t *testing.T) {
 	mux := dynamicapi.NewDynamicServiceMux()
 	fileReg := dynamicapi.NewDynamicFileRegistry()
@@ -821,6 +1059,7 @@ func TestPlatformReflection(t *testing.T) {
 		FileRegistry: fileReg,
 		Deps:         managedresource.Deps{Validator: validator},
 		PlatformDeps: platformresource.Deps{Resources: application.NewPlatformResourceService(store)},
+		Registry:     managedresource.NewActiveResourceRegistry(),
 	}
 
 	schema := kindaddon.Schema()
@@ -975,6 +1214,7 @@ func newActivatorWithResourcesAndPlatform(t *testing.T) activatorPlatformResourc
 			PlatformDeps: platformresource.Deps{
 				Resources: platformResourceSvc,
 			},
+			Registry: managedresource.NewActiveResourceRegistry(),
 		},
 		conn:    conn,
 		typeSvc: application.NewExtensionResourceTypeService(store),
