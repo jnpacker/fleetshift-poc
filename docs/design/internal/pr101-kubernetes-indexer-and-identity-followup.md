@@ -1,9 +1,10 @@
 # Kubernetes indexer & identity resolution deep dive (follow-up to the PR #115 review)
 
-This document is a follow-up to [`pr115-inventory-api-review.md`](pr115-inventory-api-review.md). It covers two related but distinct topics that came up in discussion after that review:
+This document is a follow-up to [`pr115-inventory-api-review.md`](pr115-inventory-api-review.md). It covers three related but distinct topics that came up in discussion after that review:
 
 1. **Identity resolution mechanics** — a precise, source-grounded explanation of how (and whether) two different extension resources actually get linked to one platform identity via aliases, correcting some imprecise framing from the initial discussion.
 2. **The Kubernetes indexing pipeline** — a separate, *unmerged* pull request ([fleetshift/fleetshift-poc#101](https://github.com/fleetshift/fleetshift-poc/pull/101)) that implements the actual Kubernetes-side watcher/discovery/edge-computation agent. This section covers its relationship to ACM's `search-collector`, its CRD-discovery mechanism, and a comparison of GraphQL vs. this PR's relational edge-table approach for exposing relationship data.
+3. **All existing extensions, how they relate to discovery today, and how a different extension would add its own** — since only one addon (`kubernetes`, and even that is unmerged) has any discovery logic at all, this section maps out why the other two real addons (`kind`, `gcphcp`) don't need their own Kubernetes-level discovery, and what a bespoke discovery mechanism for a genuinely different kind of target (e.g., GCP cloud resources) would need to look like.
 
 PR #101 and PR #115 are different, independently-authored efforts that are **currently incompatible** — see the "Status" note in Part 2 for details.
 
@@ -180,6 +181,36 @@ I searched the production code for any `INSERT INTO resource_alias_contributions
 
 ### Putting it together — how two extensions actually get connected today
 
+```mermaid
+graph TB
+    subgraph Platform["Platform identity layer"]
+        PR["PlatformResource<br/>name: clusters/dev"]
+    end
+
+    subgraph Extensions["Extension resources (each owns its own reported_aliases)"]
+        ER_KIND["Kind<br/>//kind.fleetshift.io/clusters/dev"]
+        ER_GCP["GCP Host Connector<br/>//gcphcp.fleetshift.io/clusters/imported-1"]
+        ER_ACS["ACS<br/>//acs.fleetshift.io/clusters/scan-42"]
+    end
+
+    subgraph Accepted["Accepted identity: resource_alias_claims + resource_alias_contributions"]
+        CLAIM["claim: gcp/project_id/my-project-123<br/>-&gt; clusters/dev, platform_owned=true"]
+    end
+
+    subgraph Pending["Pending, unreconciled: reported_aliases JSONB (per extension resource)"]
+        PEND["ACS reports kubernetes/kube_system_uid/abc-123<br/>-&gt; sits inert, nothing reads this"]
+    end
+
+    OP["Operator / trusted flow"] -->|"PlatformResource.AddAlias()"| CLAIM
+    CLAIM -->|"ResolveAliasesBatch resolves alias to name"| ER_GCP
+    ER_KIND -->|"shared (collection_name, resource_id) join"| PR
+    ER_GCP -->|"redirected by resolved claim, writes under same name"| PR
+    ER_ACS -.->|"ApplyDelta/ReplaceInventory writes only this"| PEND
+    PEND -.->|"no promotion pipeline exists yet"| CLAIM
+```
+
+Solid arrows are working paths today; the dashed arrows show why ACS's own reported alias never connects it to `clusters/dev` on its own — it has no route into the accepted `resource_alias_claims` table without an operator (or some future reconciler) explicitly promoting it.
+
 **What works:**
 
 1. **Shared name.** Both reporters already know (or are told) the same canonical name and report under it directly. Zero alias machinery involved.
@@ -254,6 +285,20 @@ func (m *InformerManager) RunContinuous(ctx context.Context, denyList, allowList
 ```
 
 A dedicated informer watches `CustomResourceDefinition` objects themselves. Whenever a CRD is installed, updated, or removed on the target cluster, this triggers a throttled (minimum 10 seconds between cycles) re-discovery and re-reconciliation of the running informer set — so a newly-installed custom kind starts being watched automatically, without a restart.
+
+```mermaid
+flowchart TB
+    Start(["target becomes ready\n(StartIndexing)"]) --> Discover["discoverAndReconcile:\nSupportedResources + FilterSupportedResources"]
+    Discover --> Reconcile["InformerManager.Reconcile\n(start new / stop removed per-GVR informers)"]
+    Reconcile --> Watch["Each GenericInformer:\nLIST + WATCH its own GVR\n(built-in kinds AND CRD-backed kinds alike)"]
+    Reconcile --> CRDWatch["Dedicated informer on\napiextensions.k8s.io/v1 CustomResourceDefinitions"]
+    CRDWatch -->|"CRD added / updated / removed"| Throttle{"10s+ since\nlast reconcile?"}
+    Throttle -->|"yes"| Discover
+    Throttle -->|"no"| Wait["schedule reconcile after\nremaining throttle window"]
+    Wait --> Discover
+```
+
+The loop on the right is what makes CRD/kind discovery dynamic rather than a one-time startup scan: installing a new CRD on the target cluster feeds back into rediscovering and watching the kind it defines, without restarting the agent.
 
 ### Comparison to ACM's `search-collector`
 
@@ -341,3 +386,128 @@ An edge table (as implemented here: `source_uid, dest_uid, edge_type, source_kin
 - Edge semantics are currently narrow and Kubernetes-specific, hardcoded via Go `BuildEdges` closures per resource kind — not a generic graph capability other addons get for free.
 
 **Takeaway:** FleetShift copied the genuinely hard-to-get-right part of ACM's design (watch/list correctness, dedup, batching, CRD-reactive discovery) but deliberately did not copy ACM's query layer, trading ACM's signature "click through relationships" UX for one platform-wide, AIP-consistent search surface that fits an addon-extensible type system better. The real gap this leaves: rich exploratory graph browsing like ACM's search console would need either a GraphQL layer on top of this same edge data, or a bespoke "expand relationships" REST method — the flat CEL-filtered endpoint alone doesn't give that experience for free.
+
+---
+
+## Part 3: All existing extensions — target types, discovery, and how another extension would add its own
+
+### The three real addons in this codebase today
+
+| Addon | ID | Capabilities declared on `main` | Discovery/indexing logic? |
+|---|---|---|---|
+| `kind` | `kind.fleetshift.io` | `DeliveryCapability{TargetType: "kind"}`, `ManagedResourceCapability{ClusterResourceType}` | None. Delivery-only. |
+| `gcphcp` | `gcphcp.fleetshift.io` | `DeliveryCapability{TargetType: "gcphcp"}`, `ManagedResourceCapability{ClusterResourceType}` | None. Delivery-only. |
+| `kubernetes` | `kubernetes.fleetshift.io` | `DeliveryCapability{TargetType: "kubernetes"}` (on `main`) | None on `main`. PR #101 (unmerged) adds `IndexCapability{TargetType: "kubernetes"}` + the full discovery/informer/writer pipeline covered in Part 2. |
+
+`IndexCapability` and `IndexAgent` do not exist anywhere on `main` today — confirmed by search. They are exclusively part of the unmerged PR #101.
+
+### Why `kind` and `gcphcp` don't need their own Kubernetes-level discovery
+
+This is the key structural fact that makes "only one extension has discovery" less surprising than it first looks: **`kind` and `gcphcp` each provision a real Kubernetes cluster, and both explicitly register that provisioned cluster as a *separate*, generically-typed target — `TargetType: "kubernetes"` — rather than under their own addon-specific type.**
+
+From `kind`'s `cluster_output.go`:
+
+```go
+// KubernetesTargetType is the [domain.TargetType] for Kubernetes
+// clusters provisioned by the kind addon. The kubernetes-direct
+// delivery agent handles delivery to these targets.
+const KubernetesTargetType domain.TargetType = "kubernetes"
+
+func (o *ClusterOutput) Target() domain.ProvisionedTarget {
+	...
+	return domain.ProvisionedTarget{
+		ID:   o.TargetID,       // "k8s-" + cluster name
+		Type: KubernetesTargetType,
+		...
+	}
+}
+```
+
+From `gcphcp`'s `target_ids.go` / `descriptor.go`:
+
+```go
+// KubernetesTargetType is the [domain.TargetType] for Kubernetes
+// clusters provisioned by the GCP HCP addon.
+const KubernetesTargetType domain.TargetType = "kubernetes"
+
+// GuestTargetID returns the ID of the emitted Kubernetes target for a
+// provisioned hosted cluster.
+func GuestTargetID(clusterName string) domain.TargetID {
+	return domain.TargetID("k8s-" + clusterName)
+}
+```
+
+Both addons follow the identical pattern independently. This produces a clean **two-target model** per provisioned cluster:
+
+1. **The provisioning/control-plane target** — `TargetType: "kind"` or `TargetType: "gcphcp"`. This is where the platform delivers "create/update/delete this cluster" manifests. Each addon owns and handles this type exclusively.
+2. **The guest/workload target** — `TargetType: "kubernetes"`, shared and generic. This represents the *resulting* cluster's own API server. Because both addons register it under the same shared type, **any addon that declares a capability for `TargetType: "kubernetes"` automatically applies to it** — dispatch is by target type, not by which addon happened to provision the target. In PR #101's (unmerged) `AddonManager`, this is `HandleTargetReady`'s `hasIndexCapabilityForTargetType(rec.addon.Capabilities, target.Type())` check: it dispatches `StartIndexing` to any connected addon whose declared `IndexCapability.TargetType` matches the target's own type, with no reference at all to which addon originally provisioned that target.
+
+```mermaid
+graph TB
+    subgraph Provisioning["Provisioning-side addons -- each owns its own TargetType for delivery"]
+        KindAddon["kind.fleetshift.io<br/>DeliveryCapability(TargetType=kind)"]
+        GcphcpAddon["gcphcp.fleetshift.io<br/>DeliveryCapability(TargetType=gcphcp)"]
+    end
+
+    subgraph Shared["Shared guest-cluster addon"]
+        K8sAddon["kubernetes.fleetshift.io<br/>DeliveryCapability(TargetType=kubernetes)<br/>+ IndexCapability(TargetType=kubernetes) -- unmerged PR#101"]
+    end
+
+    KindAddon -->|"provisions a cluster,<br/>emits guest target"| KindGuest["ProvisionedTarget<br/>Type: kubernetes, ID: k8s-&lt;name&gt;"]
+    GcphcpAddon -->|"provisions a cluster,<br/>emits guest target"| GcphcpGuest["ProvisionedTarget<br/>Type: kubernetes, ID: k8s-&lt;name&gt;"]
+
+    KindGuest -->|"HandleTargetReady matches by TargetType"| K8sAddon
+    GcphcpGuest -->|"HandleTargetReady matches by TargetType"| K8sAddon
+
+    K8sAddon -->|"Deliver: apply manifests"| KindGuest
+    K8sAddon -->|"Deliver: apply manifests"| GcphcpGuest
+    K8sAddon -.->|"StartIndexing (unmerged):<br/>same discovery.go/informer.go pipeline"| KindGuest
+    K8sAddon -.->|"StartIndexing (unmerged):<br/>same discovery.go/informer.go pipeline"| GcphcpGuest
+```
+
+**The consequence:** once PR #101's `IndexCapability`/`IndexAgent` lands (and is rebased onto PR #115's write API), `kind` and `gcphcp` inherit full CRD/kind discovery and indexing *for free*, for everything happening *inside* the clusters they provision — Pods, Deployments, arbitrary CRDs, all of it — without writing a single line of discovery code themselves. This is exactly why only one addon needs discovery logic: it isn't that the other two are missing something, it's that "index whatever's inside a Kubernetes API server" is a generic capability that applies uniformly to any target of that shared type, regardless of who provisioned it.
+
+### What would still need bespoke discovery
+
+The free ride above only covers what's visible *through the guest cluster's own Kubernetes API*. It does **not** cover anything an addon's own control plane manages that lives *outside* that API surface. For `gcphcp`, that's the actual GCP-level cloud resources backing the hosted control plane — the GCE instances, networking, IAM bindings, etc. that Kubernetes' own discovery API has no visibility into at all. An addon in that position would need its own bespoke discovery mechanism, following the same *shape* as the Kubernetes one but built against entirely different primitives:
+
+```mermaid
+graph TB
+    subgraph Generic["Generic shape any IndexAgent implementation follows"]
+        D1["1. Enumerate resource types<br/>(addon/target-specific API)"]
+        D2["2. Filter (allow/deny)"]
+        D3["3. Per-type watch or poll"]
+        D4["4. Extract fields into<br/>InventoryReplacement / InventoryDelta"]
+        D5["5. InventoryReportService<br/>.ReplaceBatch / .ApplyDeltaBatch"]
+        D1 --> D2 --> D3 --> D4 --> D5
+    end
+
+    subgraph K8sConcrete["Kubernetes -- built, unmerged PR#101"]
+        K1["ServerPreferredResources()<br/>built-in kinds + CRD-backed kinds"]
+        K2["DefaultDenyList + user allow/deny"]
+        K3["GenericInformer per GVR<br/>(LIST + WATCH)"]
+        K4["ExtractObservedResource<br/>schema-driven field extraction"]
+        K5["ApplyDelta (old API --<br/>needs rewiring to ReplaceInventory/<br/>ApplyInventoryDeltas to work against main)"]
+        K1-->K2-->K3-->K4-->K5
+    end
+
+    subgraph GcpConcrete["GCP cloud resources -- hypothetical, not built"]
+        G1["Cloud Asset Inventory API<br/>or per-service List calls<br/>(Compute, Cloud SQL, IAM, ...)"]
+        G2["Filter by service/resource kind"]
+        G3["Per-type poller --<br/>GCP has no generic WATCH primitive;<br/>Cloud Asset Feed gives near-real-time push"]
+        G4["Extract fields per GCP resource kind<br/>-- bespoke, addon-authored"]
+        G5["InventoryReportService<br/>.ReplaceBatch / .ApplyDeltaBatch"]
+        G1-->G2-->G3-->G4-->G5
+    end
+
+    D1 -. instance of .-> K1
+    D5 -. instance of .-> K5
+    D1 -. instance of .-> G1
+    D5 -. instance of .-> G5
+```
+
+The important thing carried across both concrete instances is the *bottom* of the pipeline, not the top: whatever addon-specific discovery/enumeration mechanism a new extension builds, it ends up calling the same generic `InventoryReportService.ReplaceBatch`/`ApplyDeltaBatch` API from PR #115 — that's the one piece every addon shares, regardless of what kind of target it's discovering things on. Kubernetes' discovery API happens to make step 1-3 unusually clean and generic (one call enumerates everything, one primitive — WATCH — covers every kind); a cloud-provider addon doing the same thing would need more bespoke, per-service code for those same steps, because most cloud provider APIs don't offer a single generic "list every kind of resource, then watch all of them" primitive the way Kubernetes does.
+
+### Where this connects back to aliases (Part 1)
+
+If `gcphcp` ever built the hypothetical GCP-resource indexer above, it would very plausibly end up reporting inventory for *the same physical thing* that the shared `kubernetes` indexer already reports on from a different angle — e.g., a GCE instance backing a Kubernetes `Node` object. That's exactly the correlation scenario Part 1 describes: two different extension resources (`//gcphcp.fleetshift.io/instances/...` from the new hypothetical indexer, `//kubernetes.fleetshift.io/.../nodes/...` from the existing one) describing one real-world thing, needing to be linked via a shared name or an alias (e.g., a GCP instance ID) for the platform to present them as one correlated identity rather than two disconnected records. The identity/alias mechanics in Part 1 apply exactly the same way regardless of which addon originates the report — aliases are the general-purpose correlation mechanism precisely because different addons will inevitably discover overlapping real-world resources through completely different discovery mechanisms, as this section illustrates.

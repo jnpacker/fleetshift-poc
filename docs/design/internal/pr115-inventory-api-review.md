@@ -1084,6 +1084,33 @@ The full source of `reportResolver` (~100 lines, in `inventory_report_service.go
 - **Cross-chunk duplicate detection**: `rejectDuplicateReports` tracks `seenNames` on the resolver instance itself (not scoped per chunk), so it catches a resource resolved twice even when the two reports land in different chunks of the same overall batch — whether because two reports named the same resource directly, or because a by-Name and a by-Alias report both resolved to the same underlying resource.
 - **All-or-nothing**: any resolution failure anywhere in the batch (missing type inventory metadata, a report with neither `Name` nor `Aliases`, an unresolvable or contradictory alias, or a duplicate resolved target anywhere in the call, even in an earlier chunk) aborts the whole call before any inventory write is attempted — nothing is persisted until the caller commits the transaction.
 
+#### Write-path flow (as shipped)
+
+```mermaid
+sequenceDiagram
+    participant Caller as Reporter (any addon)
+    participant Svc as InventoryReportService
+    participant Res as reportResolver
+    participant IdRepo as ResourceIdentityRepository
+    participant ErRepo as ExtensionResourceRepository
+    participant DB as extension_resources /<br/>extension_resource_inventory
+
+    Caller->>Svc: ReplaceBatch(reports)
+    Svc->>Svc: chunk reports (max 1000)
+    loop each chunk
+        Svc->>Res: resolveBatch(identities)
+        Res->>ErRepo: GetType (cached per ResourceType)
+        Res->>IdRepo: ResolveAliasesBatch<br/>(only for by-Name-less reports)
+        IdRepo-->>Res: accepted alias -> ResourceName map
+        Res-->>Svc: resolved ResourceName per report
+        Svc->>ErRepo: ReplaceInventory(replacements)
+        ErRepo->>DB: resolve-or-create extension_resources row<br/>+ upsert extension_resource_inventory<br/>+ write reported_aliases (pending, unreconciled)
+    end
+    Svc-->>Caller: commit or all-or-nothing error
+```
+
+Note what this diagram does *not* show: nothing in this flow ever writes to `resource_alias_claims`/`resource_alias_contributions` (the *accepted* identity tables) — those are populated only via a separate `PlatformResource.AddAlias()` path, unrelated to inventory reporting. See [`pr101-kubernetes-indexer-and-identity-followup.md`](pr101-kubernetes-indexer-and-identity-followup.md) for the full identity-resolution picture, including how (and whether) two different extensions' reports actually end up linked to the same platform identity.
+
 ---
 
 ## Benchmark results
