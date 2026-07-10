@@ -293,6 +293,80 @@ func TestCompileFilter_UnsupportedOperators(t *testing.T) {
 	for _, filter := range []string{
 		`name.matches("ext.*")`,
 		`1 + 1 == 2`,
+		`name.endsWith("x")`,
+		`name.contains("x")`,
+	} {
+		err := compileErr(t, filter)
+		if !errors.Is(err, domain.ErrInvalidArgument) {
+			t.Errorf("filter %q: err = %v, want ErrInvalidArgument", filter, err)
+		}
+	}
+}
+
+// TestCompileFilter_StartsWith compiles field.startsWith("prefix") to a
+// parameterized LIKE predicate with LIKE metacharacters in the prefix
+// escaped, so a user-supplied "%" or "_" cannot widen the match.
+func TestCompileFilter_StartsWith(t *testing.T) {
+	tests := []struct {
+		name     string
+		filter   string
+		wantSQL  string
+		wantArgs []any
+	}{
+		{
+			name:     "simple prefix",
+			filter:   `name.startsWith("//kind.fleetshift.io/")`,
+			wantSQL:  `name LIKE $1 ESCAPE '\'`,
+			wantArgs: []any{`//kind.fleetshift.io/%`},
+		},
+		{
+			name:     "escapes LIKE metacharacters",
+			filter:   `name.startsWith("a%b_c\\d")`,
+			wantSQL:  `name LIKE $1 ESCAPE '\'`,
+			wantArgs: []any{`a\%b\_c\\d%`},
+		},
+		{
+			name:     "empty prefix matches any non-null string",
+			filter:   `name.startsWith("")`,
+			wantSQL:  `name LIKE $1 ESCAPE '\'`,
+			wantArgs: []any{`%`},
+		},
+		{
+			name:     "nested field path",
+			filter:   `resource.labels["team"].startsWith("plat")`,
+			wantSQL:  `resource.labels.team LIKE $1 ESCAPE '\'`,
+			wantArgs: []any{`plat%`},
+		},
+		{
+			name:     "and with startsWith",
+			filter:   `resource_type == "kind.fleetshift.io/Cluster" && name.startsWith("//kind")`,
+			wantSQL:  `(resource_type = $1) AND (name LIKE $2 ESCAPE '\')`,
+			wantArgs: []any{"kind.fleetshift.io/Cluster", `//kind%`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pred := compile(t, tt.filter)
+			if pred.SQL != tt.wantSQL {
+				t.Errorf("SQL = %q, want %q", pred.SQL, tt.wantSQL)
+			}
+			if len(pred.Args) != len(tt.wantArgs) {
+				t.Fatalf("Args = %v, want %v", pred.Args, tt.wantArgs)
+			}
+			for i, want := range tt.wantArgs {
+				if pred.Args[i] != want {
+					t.Errorf("Args[%d] = %v, want %v", i, pred.Args[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestCompileFilter_StartsWithRequiresFieldAndStringLiteral(t *testing.T) {
+	for _, filter := range []string{
+		`"literal".startsWith("lit")`,
+		`name.startsWith(resource_type)`,
+		`name.startsWith(1)`,
 	} {
 		err := compileErr(t, filter)
 		if !errors.Is(err, domain.ErrInvalidArgument) {
@@ -426,6 +500,50 @@ func TestCompileFilter_CompareHookOverridesGenericComparison(t *testing.T) {
 	}
 	if !strings.Contains(pred.SQL, "resource_type != $1") {
 		t.Errorf("SQL = %q, want generic fallback for !=", pred.SQL)
+	}
+}
+
+// TestCompileFilter_StartsWithHookOverridesGenericStartsWith proves a
+// [querysql.SQLExpr.StartsWith] hook can replace the generic
+// "SQL LIKE ..." path when it reports handled=true, and that
+// handled=false falls back to the generic path.
+func TestCompileFilter_StartsWithHookOverridesGenericStartsWith(t *testing.T) {
+	c := querysql.Compiler{Fields: recordingResolver(func(path querysql.FieldPath, _ querysql.TypeHint, _ querysql.ResolveContext) (querysql.SQLExpr, error) {
+		return querysql.SQLExpr{
+			SQL: path.String(),
+			StartsWith: func(prefix string, bind func(any) string) (string, bool, error) {
+				if prefix != "A" {
+					return "", false, nil
+				}
+				return "STARTS_OVERRIDDEN(" + bind(prefix) + ")", true, nil
+			},
+		}, nil
+	})}
+
+	pred, err := c.CompileFilter(context.Background(), querysql.CompileFilterInput{
+		Filter: `name.startsWith("A")`,
+	})
+	if err != nil {
+		t.Fatalf("CompileFilter: %v", err)
+	}
+	if pred.SQL != "STARTS_OVERRIDDEN($1)" {
+		t.Errorf("SQL = %q, want STARTS_OVERRIDDEN($1)", pred.SQL)
+	}
+	if len(pred.Args) != 1 || pred.Args[0] != "A" {
+		t.Errorf("Args = %#v, want [\"A\"]", pred.Args)
+	}
+
+	pred, err = c.CompileFilter(context.Background(), querysql.CompileFilterInput{
+		Filter: `name.startsWith("b")`,
+	})
+	if err != nil {
+		t.Fatalf("CompileFilter (fallback): %v", err)
+	}
+	if !strings.Contains(pred.SQL, "name LIKE $1 ESCAPE") {
+		t.Errorf("SQL = %q, want generic LIKE fallback", pred.SQL)
+	}
+	if len(pred.Args) != 1 || pred.Args[0] != `b%` {
+		t.Errorf("Args = %#v, want [\"b%%\"]", pred.Args)
 	}
 }
 

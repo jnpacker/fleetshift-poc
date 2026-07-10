@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/domain"
@@ -41,6 +42,25 @@ func runEnvelopeFieldFilterTests(t *testing.T, factory Factory) {
 		}
 		if results[0].Platform != nil {
 			t.Errorf("Platform is non-nil, want nil")
+		}
+	})
+
+	t.Run("NameStartsWithMatchesPrefix", func(t *testing.T) {
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		wantName := extensionEnvelopeName(fx.ManagedType, fx.ManagedName)
+		results := queryAll(t, tx, fmt.Sprintf(`name.startsWith(%q)`, "//"+string(fx.ManagedType.ServiceName())+"/"))
+		if len(results) != 1 {
+			t.Fatalf("len(results) = %d, want 1", len(results))
+		}
+		if results[0].Name != wantName {
+			t.Errorf("Name = %q, want %q", results[0].Name, wantName)
+		}
+
+		results = queryAll(t, tx, `name.startsWith("//does-not-exist/")`)
+		if len(results) != 0 {
+			t.Fatalf("len(results) = %d, want 0 for a non-matching prefix", len(results))
 		}
 	})
 
@@ -89,6 +109,25 @@ func runResourceFieldFilterTests(t *testing.T, factory Factory) {
 		}
 		if results[0].Name != extensionEnvelopeName(fx.ManagedType, fx.ManagedName) {
 			t.Errorf("result Name = %q, want the managed cluster", results[0].Name)
+		}
+	})
+
+	t.Run("ExtensionLabelsStartsWith", func(t *testing.T) {
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		wantName := extensionEnvelopeName(fx.ManagedType, fx.ManagedName)
+		results := queryAll(t, tx, `resource.labels["team"].startsWith("plat")`)
+		if len(results) != 1 {
+			t.Fatalf("len(results) = %d, want 1", len(results))
+		}
+		if results[0].Name != wantName {
+			t.Errorf("result Name = %q, want the managed cluster", results[0].Name)
+		}
+
+		results = queryAll(t, tx, `resource.labels["team"].startsWith("ops")`)
+		if len(results) != 0 {
+			t.Fatalf("len(results) = %d, want 0 for a non-matching prefix", len(results))
 		}
 	})
 
@@ -215,6 +254,33 @@ func runResourceFieldFilterTests(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("StateFilterLowercasesLiterals", func(t *testing.T) {
+		// fulfillments.state is stored lowercase ("creating"); Get/List
+		// expose proto enum names ("CREATING"). Compiling resource.state
+		// comparisons lowercases the literal so both spellings match.
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		wantName := extensionEnvelopeName(fx.ManagedType, fx.ManagedName)
+		for _, filter := range []string{
+			`resource.state == "creating"`,
+			`resource.state == "CREATING"`,
+		} {
+			results := queryAll(t, tx, filter)
+			if len(results) != 1 {
+				t.Fatalf("filter %q: len(results) = %d, want 1", filter, len(results))
+			}
+			if results[0].Name != wantName {
+				t.Errorf("filter %q: Name = %q, want %q", filter, results[0].Name, wantName)
+			}
+		}
+
+		results := queryAll(t, tx, `resource.state == "ACTIVE"`)
+		if len(results) != 0 {
+			t.Fatalf(`resource.state == "ACTIVE": len(results) = %d, want 0 (fixture is creating)`, len(results))
+		}
+	})
+
 	t.Run("PlatformOnlyBodyFieldsAreInvalid", func(t *testing.T) {
 		tx, _ := newFixtureTx(t, factory)
 		defer tx.Rollback()
@@ -229,6 +295,118 @@ func runResourceFieldFilterTests(t *testing.T, factory Factory) {
 			if !errors.Is(err, domain.ErrInvalidArgument) {
 				t.Errorf("filter %q: err = %v, want ErrInvalidArgument", filter, err)
 			}
+		}
+	})
+}
+
+// runCaseSensitivityFilterTests locks the cross-backend case contract:
+// ordinary string fields (== and startsWith) are case-sensitive, while
+// resource.state folds API enum spellings to the lowercase storage form
+// for == / startsWith. SQLite's default LIKE is ASCII-case-insensitive,
+// so these cases catch a backend that forgot case_sensitive_like.
+func runCaseSensitivityFilterTests(t *testing.T, factory Factory) {
+	t.Run("NameEqualityIsCaseSensitive", func(t *testing.T) {
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		name := extensionEnvelopeName(fx.ManagedType, fx.ManagedName)
+		results := queryAll(t, tx, fmt.Sprintf("name == %q", name))
+		if len(results) != 1 {
+			t.Fatalf("exact name: len(results) = %d, want 1", len(results))
+		}
+
+		results = queryAll(t, tx, fmt.Sprintf("name == %q", strings.ToUpper(name)))
+		if len(results) != 0 {
+			t.Fatalf("uppercased name: len(results) = %d, want 0 (equality is case-sensitive)", len(results))
+		}
+	})
+
+	t.Run("NameStartsWithIsCaseSensitive", func(t *testing.T) {
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		prefix := "//" + string(fx.ManagedType.ServiceName()) + "/"
+		results := queryAll(t, tx, fmt.Sprintf(`name.startsWith(%q)`, prefix))
+		if len(results) != 1 {
+			t.Fatalf("matching prefix: len(results) = %d, want 1", len(results))
+		}
+
+		results = queryAll(t, tx, fmt.Sprintf(`name.startsWith(%q)`, strings.ToUpper(prefix)))
+		if len(results) != 0 {
+			t.Fatalf("uppercased prefix: len(results) = %d, want 0 (startsWith is case-sensitive)", len(results))
+		}
+	})
+
+	t.Run("LabelEqualityIsCaseSensitive", func(t *testing.T) {
+		tx, _ := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		results := queryAll(t, tx, `resource.labels["team"] == "platform"`)
+		if len(results) != 1 {
+			t.Fatalf(`== "platform": len(results) = %d, want 1`, len(results))
+		}
+
+		results = queryAll(t, tx, `resource.labels["team"] == "PLATFORM"`)
+		if len(results) != 0 {
+			t.Fatalf(`== "PLATFORM": len(results) = %d, want 0`, len(results))
+		}
+	})
+
+	t.Run("LabelStartsWithIsCaseSensitive", func(t *testing.T) {
+		tx, _ := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		results := queryAll(t, tx, `resource.labels["team"].startsWith("plat")`)
+		if len(results) != 1 {
+			t.Fatalf(`startsWith("plat"): len(results) = %d, want 1`, len(results))
+		}
+
+		results = queryAll(t, tx, `resource.labels["team"].startsWith("PLAT")`)
+		if len(results) != 0 {
+			t.Fatalf(`startsWith("PLAT"): len(results) = %d, want 0`, len(results))
+		}
+	})
+
+	t.Run("StateEqualityFoldsCase", func(t *testing.T) {
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		wantName := extensionEnvelopeName(fx.ManagedType, fx.ManagedName)
+		for _, filter := range []string{
+			`resource.state == "creating"`,
+			`resource.state == "CREATING"`,
+		} {
+			results := queryAll(t, tx, filter)
+			if len(results) != 1 {
+				t.Fatalf("filter %q: len(results) = %d, want 1", filter, len(results))
+			}
+			if results[0].Name != wantName {
+				t.Errorf("filter %q: Name = %q, want %q", filter, results[0].Name, wantName)
+			}
+		}
+	})
+
+	t.Run("StateStartsWithFoldsCase", func(t *testing.T) {
+		tx, fx := newFixtureTx(t, factory)
+		defer tx.Rollback()
+
+		wantName := extensionEnvelopeName(fx.ManagedType, fx.ManagedName)
+		for _, filter := range []string{
+			`resource.state.startsWith("cre")`,
+			`resource.state.startsWith("CRE")`,
+		} {
+			results := queryAll(t, tx, filter)
+			if len(results) != 1 {
+				t.Fatalf("filter %q: len(results) = %d, want 1", filter, len(results))
+			}
+			if results[0].Name != wantName {
+				t.Errorf("filter %q: Name = %q, want %q", filter, results[0].Name, wantName)
+			}
+		}
+
+		results := queryAll(t, tx, `resource.state.startsWith("ACT")`)
+		if len(results) != 0 {
+			t.Fatalf(`resource.state.startsWith("ACT"): len(results) = %d, want 0`, len(results))
 		}
 	})
 }

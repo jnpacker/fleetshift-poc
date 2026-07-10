@@ -37,6 +37,12 @@ type QueryResourcesRequest struct {
 	// POC envelope aliases such as platform_name, kind, service_name,
 	// api_version, collection_name, and resource_id are not supported
 	// filter fields.
+	//
+	// Ordinary string fields (== and startsWith) are case-sensitive
+	// on every backend. resource.state is the exception: comparisons
+	// and startsWith lowercase string literals so API enum spellings
+	// from Get/List ("ACTIVE") match the lowercase values stored on
+	// fulfillments.state ("active").
 	Filter string
 
 	// PageSize caps the number of rows returned. Non-positive values

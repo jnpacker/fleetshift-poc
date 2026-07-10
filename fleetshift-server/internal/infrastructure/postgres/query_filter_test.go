@@ -116,6 +116,18 @@ func TestQueryFieldResolver_EnvelopeFields(t *testing.T) {
 			filter:   `resource_type == "kind.fleetshift.io/Cluster" && name == "//kind.fleetshift.io/clusters/managed"`,
 			wantArgs: []any{"kind.fleetshift.io", "Cluster", "kind.fleetshift.io", "clusters", "managed"},
 		},
+		{
+			name:     "name startsWith uses concatenated expression",
+			filter:   `name.startsWith("//kind.fleetshift.io/")`,
+			wantArgs: []any{`//kind.fleetshift.io/%`},
+			wantSQL:  []string{"'//' || er.service_name || '/' || er.collection_name || '/' || er.resource_id LIKE", `ESCAPE '\'`},
+		},
+		{
+			name:     "resource_type startsWith uses concatenated expression",
+			filter:   `resource_type.startsWith("kind.fleetshift.io/")`,
+			wantArgs: []any{`kind.fleetshift.io/%`},
+			wantSQL:  []string{"er.service_name || '/' || er.type_name LIKE", `ESCAPE '\'`},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -188,6 +200,28 @@ func TestQueryFieldResolver_ResourceLabelsInequalityKeepsExtraction(t *testing.T
 	}
 	if strings.Contains(pred.SQL, "@>") {
 		t.Errorf("SQL = %q, != must not use containment rewrite", pred.SQL)
+	}
+}
+
+func TestQueryFieldResolver_ResourceLabelsStartsWithUsesExtraction(t *testing.T) {
+	pred := compile(t, `resource.labels["team"].startsWith("plat")`)
+	if len(pred.Args) != 2 {
+		t.Fatalf("Args = %v, want 2 (label key + LIKE pattern)", pred.Args)
+	}
+	if pred.Args[0] != "team" {
+		t.Errorf("Args[0] = %v, want \"team\" (the label key)", pred.Args[0])
+	}
+	if pred.Args[1] != `plat%` {
+		t.Errorf("Args[1] = %v, want \"plat%%\"", pred.Args[1])
+	}
+	if !strings.Contains(pred.SQL, "er.labels ->>") {
+		t.Errorf("SQL = %q, want ->> extraction for startsWith", pred.SQL)
+	}
+	if !strings.Contains(pred.SQL, "LIKE") || !strings.Contains(pred.SQL, `ESCAPE '\'`) {
+		t.Errorf("SQL = %q, want LIKE ... ESCAPE", pred.SQL)
+	}
+	if strings.Contains(pred.SQL, "@>") {
+		t.Errorf("SQL = %q, startsWith must not use containment rewrite", pred.SQL)
 	}
 }
 
@@ -455,6 +489,7 @@ func TestQueryFieldResolver_ManagedFields(t *testing.T) {
 	}{
 		{`resource.intent_version == 1`, "erm.current_version"},
 		{`resource.state == "active"`, "f.state"},
+		{`resource.state == "ACTIVE"`, "f.state"},
 		{`resource.pause_reason == "manual"`, "f.pause_reason"},
 		{`resource.generation == 3`, "f.generation"},
 	} {
@@ -462,6 +497,34 @@ func TestQueryFieldResolver_ManagedFields(t *testing.T) {
 		if !strings.Contains(pred.SQL, tt.column) {
 			t.Errorf("filter %q: SQL = %q, want it to reference column %q", tt.filter, pred.SQL, tt.column)
 		}
+	}
+
+	// API enum spelling must bind the domain storage value.
+	pred := compile(t, `resource.state == "ACTIVE"`)
+	found := false
+	for _, a := range pred.Args {
+		if a == "active" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("args = %#v, want to include normalized \"active\"", pred.Args)
+	}
+
+	pred = compile(t, `resource.state.startsWith("CRE")`)
+	if !strings.Contains(pred.SQL, "f.state LIKE") || !strings.Contains(pred.SQL, `ESCAPE '\'`) {
+		t.Errorf("SQL = %q, want f.state LIKE ... ESCAPE", pred.SQL)
+	}
+	found = false
+	for _, a := range pred.Args {
+		if a == "cre%" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("args = %#v, want to include normalized \"cre%%\"", pred.Args)
 	}
 }
 

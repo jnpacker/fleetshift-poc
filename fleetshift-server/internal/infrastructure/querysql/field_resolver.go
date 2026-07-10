@@ -64,11 +64,19 @@ const (
 // In, when non-nil, likewise overrides the generic "SQL IN (...)"
 // path -- e.g. a Postgres resolver may rewrite resource_type in
 // ["a/T", "b/U"] to (er.service_name, er.type_name) IN (...).
+//
+// StartsWith, when non-nil, overrides the generic
+// "SQL LIKE <escaped prefix>% ESCAPE ..." path for
+// field.startsWith("prefix"). Resolvers use this for field-specific
+// case folding (e.g. lowercasing the prefix for stored-lowercase
+// columns) or dialect-specific prefix predicates; handled=false keeps
+// the generic LIKE.
 type SQLExpr struct {
 	SQL string
 
-	Compare func(op ComparisonOperator, lit any, bind func(any) string) (sql string, handled bool, err error)
-	In      func(values []any, bind func(any) string) (sql string, handled bool, err error)
+	Compare    func(op ComparisonOperator, lit any, bind func(any) string) (sql string, handled bool, err error)
+	In         func(values []any, bind func(any) string) (sql string, handled bool, err error)
+	StartsWith func(prefix string, bind func(any) string) (sql string, handled bool, err error)
 }
 
 // ResolveContext carries the per-compilation state a [FieldResolver]
@@ -99,12 +107,13 @@ type ResolveContext struct {
 
 // FieldResolver maps a CEL field path to a SQL expression. This
 // package's compiler owns CEL AST lowering -- boolean/comparison
-// structure, literals, in, parameter binding, resource_type guard
-// detection -- and knows about field paths only generically; a
-// FieldResolver owns the actual row shape a path reads from (column
-// names, JSON extraction, schema-backed path validation). See the
-// postgres package's query field resolver for this project's current
-// implementation; a future SQLite QueryRepo would supply its own.
+// structure, literals, in, startsWith, parameter binding,
+// resource_type guard detection -- and knows about field paths only
+// generically; a FieldResolver owns the actual row shape a path reads
+// from (column names, JSON extraction, schema-backed path
+// validation). See the postgres package's query field resolver for
+// this project's current implementation; a future SQLite QueryRepo
+// would supply its own.
 type FieldResolver interface {
 	Resolve(path FieldPath, hint TypeHint, ctx ResolveContext) (SQLExpr, error)
 }
