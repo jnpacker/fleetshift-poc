@@ -74,6 +74,11 @@ type DeliveryRepository interface {
 type ExtensionResourceRepository interface {
 	// Type registration
 	CreateType(ctx context.Context, def ExtensionResourceType) error
+	// UpdateType persists capability metadata (management / inventory)
+	// and updated_at for an existing type. API identity fields
+	// (resource type, version, collection) are matched by primary key
+	// and are not rewritten beyond what the caller supplies on def.
+	UpdateType(ctx context.Context, def ExtensionResourceType) error
 	GetType(ctx context.Context, rt ResourceType) (ExtensionResourceType, error)
 	ListTypes(ctx context.Context) ([]ExtensionResourceType, error)
 	DeleteType(ctx context.Context, rt ResourceType) error
@@ -105,6 +110,11 @@ type ExtensionResourceRepository interface {
 	// interface, these resolve-or-create the extension_resources row
 	// themselves (see [InventoryReplacement]/[InventoryDelta]'s natural
 	// key doc) rather than requiring the row to already exist.
+	//
+	// TODO: Consider requiring that these validate the type(s) actually
+	// have inventory capabilities in their specs. This MUST be doable
+	// with at most one additional DB lookup for the whole batch,
+	// in that case.
 	//
 	// ReplaceInventory treats each [InventoryReplacement] as the
 	// complete latest inventory state for its resource: fields absent
@@ -345,10 +355,9 @@ func ValidateInventoryDelta(d InventoryDelta) error {
 // and Create/Update -- a separate, deliberately-not-yet-connected
 // concept from [InventoryReplacement.Aliases]'s pending, per-extension-
 // resource reported payload. Inventory reporting's ReplaceInventory/
-// ApplyInventoryDeltas do not call into this repository's aliases at
-// all in this iteration; a future asynchronous reconciliation process
-// is what will eventually decide which reported aliases become
-// accepted here.
+// ApplyInventoryDeltas do not call into this repository's aliases;
+// a future asynchronous reconciliation process is what will
+// eventually decide which reported aliases become accepted here.
 type ResourceIdentityRepository interface {
 	Create(ctx context.Context, r *PlatformResource) error
 	GetByName(ctx context.Context, name ResourceName) (*PlatformResource, error)

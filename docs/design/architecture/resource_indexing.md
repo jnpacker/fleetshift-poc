@@ -50,7 +50,7 @@ The platform owns the indexing infrastructure:
 - index storage
 - the search API
 
-Inventory is a projection, not a literal copy of source objects. Schemas define what is extracted and made queryable.
+Inventory is a projection of what reporters extract from source objects, not a literal copy of those objects. Schemas define that extraction. Once on the platform, the same fields are available via typed Get/List and via `queryResources`.
 
 ## How indexing works
 
@@ -95,7 +95,7 @@ The inventory shape is designed to balance well-structured data the platform and
 - **Relationships**: semantic links between different platform resource identities (e.g. Pod → Service, Node → Cluster). These are modeled on the platform resource and follow the relationship model described in [resource_identity_and_api.md](resource_identity_and_api.md#semantic-relationships). Inventory reporting may contribute relationship facts, but the platform resource remains the canonical owner of the aggregated relationship graph.
   - In the future these may drive relationship-based access control, as well as general-purpose relational queries.
   - Relationships should be able to be defined using aliases.
-- **Labels**: All items in inventory should have labels, for queries & placement.
+- **Labels**: All items in inventory should have labels, for queries & placement. On the typed extension API these are reporter `local_labels`, distinct from user-writable extension `labels` on management-capable types. The index projection may still treat both as queryable label spaces; do not collapse them on the wire.
   - Be careful about attestation. Need local tracking of "who am I" (what am I labelled) which requires either (a) signatures for proof, (b) label "delivery" with authorization, or (c) the target itself being an authority of its own labels. For reporting inventory, (c) works.
 - **Properties**: stable-ish values (e.g. api_url) produced once and rarely changed. Not historical. Lives on the inventory item because a single Fulfillment can target many objects, each with its own properties. Older notes sometimes called this bucket "outputs"; the canonical term in the current design is `properties`. Properties may also be a part of objects not managed by a Fulfillment. Should be able to align with SIG Multicluster ClusterProperty and/or OCM's ClusterClaim API on the managed clusters.
   - We might want to consider how else properties can be used and if they need to be signed in any way, if they want to participate in placement.
@@ -151,7 +151,7 @@ For Kubernetes targets, the default is medium-depth indexing:
 - status conditions
 - key spec fields
 
-That covers the common fleet-wide query cases without storing full resource bodies.
+That covers the common fleet-wide query cases without reporting full source-object bodies to the platform.
 
 Default schema categories:
 
@@ -159,7 +159,7 @@ Default schema categories:
 - **Extended types**: VirtualMachines, Routes, Ingresses, CRDs
 - **Events**: opt-in with aggressive TTL
 
-For full-fidelity object access, the platform uses direct API proxying or addon-specific APIs rather than the index.
+For the full live object on a target (beyond what was reported into inventory), the platform uses direct API proxying or addon-specific APIs — not a deeper read of the index.
 
 ## Scale characteristics
 
@@ -209,43 +209,21 @@ This is one of the reasons indexing belongs in the core architecture rather than
 
 ## Search API shape
 
-The long-term platform search surface is a custom GET over an arbitrary scope (see below). **v0 ships a narrower managed-extension query** while that broader inventory search is still designed.
-
-### v0: `queryResources` (managed extension resources)
+Fleet-wide discovery needs a filterable search surface over inventory. That surface is `queryResources`: a custom GET on the platform API over a hierarchy scope, with a CEL filter over the result envelope. Coverage starts with activated extension resources — the same types already addressable via typed Get/List — and expands as more platform-held shapes are included.
 
 ```
 GET /apis/fleetshift.io/v1/{scope}:queryResources?filter={cel_expression}
 ```
 
-- **Scope**: v0 accepts only `-` (whole-platform wildcard). The URI pattern keeps `{scope=**}` so future collection scopes can land without reshaping the RPC.
-- **Filter**: CEL evaluated by the query repository (not AIP-160 list-filter syntax). Empty matches all extension rows in scope. The supported subset is boolean/logical operators (`&&`, `||`, `!`), comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), `in` list membership, and string `startsWith` (e.g. `name.startsWith("//kind.fleetshift.io/")`). Ordinary string fields are case-sensitive for both `==` and `startsWith`; `resource.state` folds API enum spellings to the lowercase storage form. Unsupported operators and macros fail closed.
-- **Pagination / ordering**: AIP-158 page tokens; optional `order_by` (`""` default, or `resource_type,name`).
-- **Response**: each hit is `name`, `resource_type`, and a `google.protobuf.Struct` body matching the dynamic managed-resource Get/List envelope (no labels/inventory fields on the Struct in v0). Typed dynamic `oneof` bodies are deferred.
+- **Scope**: a collection path in the resource hierarchy, or `-` for the whole platform. Narrower scopes (cluster, workspace, and other levels) are part of the same method as coverage grows; the URI keeps `{scope=**}` for that.
+- **Filter**: a CEL expression over the query result envelope — identity (`name`, `resource_type`) and the resource body as returned by typed Get/List for that type's capabilities (labels, managed fields, observed-state fields such as local labels, conditions, observation, and timestamps). Filters should read like the response shape, not like storage columns. Results follow the same activation boundary as the typed API surface.
+- **Pagination / ordering**: AIP-158 page tokens; deterministic ordering suitable for keyset pagination.
+- **Response**: each hit is `name`, `resource_type`, and a body matching the dynamic extension-resource Get/List envelope for that type — the same platform-held fields, not a reduced search DTO.
 
-This is the public wrapper over the existing extension-only `QueryRepository`. It does not yet search platform aggregates, inventory-only projections, or live targets.
+Fully realized, the same method covers a broader set of platform-held resource shapes (platform aggregates, inventoried and managed resources, and other inventory-held types), still filtered with CEL and still scoped through the hierarchy. Filters may limit results to specific resource types or extensions. RBAC is enforced by the platform, so users only see resources they are authorized to access.
 
-### Longer-term: `searchResources`
 
-The platform will expose a fleet-wide search endpoint as a custom GET method on the platform API surface over an arbitrary scope:
-
-```
-GET /apis/fleetshift.io/v1/{scope}:searchResources?filter={cel_expression}
-```
-
-- **Scope**: a cluster, a workspace, the whole platform, or any other level of the resource hierarchy.
-- **Filter**: a CEL expression for filtering across resource types, labels, conditions, and extension-specific fields.
-- **Pagination**: follows AIP conventions.
-
-If the platform later standardizes a short-form alias for its own API, the same method could also be exposed at `/v1/{scope}:searchResources`.
-
-Responses include:
-- Resource identity (full name including service name, e.g. `//kubernetes.fleetshift.io/clusters/foo/namespaces/bar/objects/...`)
-- Common metadata (labels, conditions)
-- A `google.protobuf.Struct` payload for extension-specific fields
-
-The search API searches across all resource shapes (platform, inventoried, managed, target). Filters may limit scope to specific resource types or extensions. RBAC is enforced by the platform, so users only see resources they are authorized to access.
-
-For full resource details, the platform falls back to typed extension APIs (e.g. `GET /apis/kubernetes.fleetshift.io/v1/clusters/foo/...`). The search projection is for fast fleet-wide discovery and observation queries, not full object fidelity. See [resource_identity_and_api.md](resource_identity_and_api.md#inventory-search-api) for how this fits into the overall API model.
+`queryResources` returns the same platform-held resource data as typed Get/List for those hits — it queries the resources. Selectivity lives in what reporters extract and send to the platform (schemas define that extraction); once data is on the platform, query and direct get see the same thing. Reaching beyond what was reported (full live objects on a target) is a different path: API proxying or addon-specific APIs, not a richer variant of this search surface. See [resource_identity_and_api.md](resource_identity_and_api.md#inventory-search-api) for how this fits into the overall API model.
 
 ## Open questions
 

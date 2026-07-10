@@ -1,4 +1,4 @@
-package managedresource
+package extensionresource
 
 import (
 	"context"
@@ -28,8 +28,8 @@ type RegisteredService struct {
 	// Desc is the gRPC service descriptor used for registration.
 	Desc *grpc.ServiceDesc
 
-	// ServiceDescriptors holds the proto descriptors for building messages.
-	Descriptors *ServiceDescriptors
+	// ExtensionServiceDescriptors holds the proto descriptors for building messages.
+	Descriptors *ExtensionServiceDescriptors
 
 	// Config is the original type config.
 	Config *ResourceTypeConfig
@@ -60,13 +60,20 @@ func BuildAndRegister(server *grpc.Server, cfg *ResourceTypeConfig, deps Deps) (
 
 // Build constructs a dynamic gRPC service without registering it.
 // Useful for testing or deferred registration.
+//
+// The gRPC method set follows which request descriptors exist: Create/
+// Delete/Resume are omitted for inventory-only (no management) types.
 func Build(cfg *ResourceTypeConfig, deps Deps) (*RegisteredService, error) {
-	specDesc, err := resolveSpecDescriptor(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("resolve spec %s: %w", cfg.SpecMessage, err)
+	var specDesc protoreflect.MessageDescriptor
+	if cfg.Capabilities.Management != nil {
+		var err error
+		specDesc, err = resolveSpecDescriptor(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("resolve spec %s: %w", cfg.Capabilities.Management.SpecMessage, err)
+		}
 	}
 
-	svcDescs, err := BuildServiceDescriptors(cfg, specDesc)
+	svcDescs, err := BuildExtensionServiceDescriptors(cfg, specDesc)
 	if err != nil {
 		return nil, fmt.Errorf("build descriptors for %s: %w", cfg.Singular, err)
 	}
@@ -79,33 +86,42 @@ func Build(cfg *ResourceTypeConfig, deps Deps) (*RegisteredService, error) {
 		collection: cfg.Collection(),
 	}
 
+	methods := make([]grpc.MethodDesc, 0, 6)
+	if svcDescs.CreateRequest != nil {
+		methods = append(methods, grpc.MethodDesc{
+			MethodName: "Create" + cfg.Singular,
+			Handler:    handler.handleCreate,
+		})
+	}
+	methods = append(methods,
+		grpc.MethodDesc{
+			MethodName: "Get" + cfg.Singular,
+			Handler:    handler.handleGet,
+		},
+		grpc.MethodDesc{
+			MethodName: "List" + cfg.Plural,
+			Handler:    handler.handleList,
+		},
+	)
+	if svcDescs.DeleteRequest != nil {
+		methods = append(methods, grpc.MethodDesc{
+			MethodName: "Delete" + cfg.Singular,
+			Handler:    handler.handleDelete,
+		})
+	}
+	if svcDescs.ResumeRequest != nil {
+		methods = append(methods, grpc.MethodDesc{
+			MethodName: "Resume" + cfg.Singular,
+			Handler:    handler.handleResume,
+		})
+	}
+
 	grpcDesc := &grpc.ServiceDesc{
 		ServiceName: cfg.GRPCServiceName(),
 		HandlerType: (*any)(nil),
-		Methods: []grpc.MethodDesc{
-			{
-				MethodName: "Create" + cfg.Singular,
-				Handler:    handler.handleCreate,
-			},
-			{
-				MethodName: "Get" + cfg.Singular,
-				Handler:    handler.handleGet,
-			},
-			{
-				MethodName: "List" + cfg.Plural,
-				Handler:    handler.handleList,
-			},
-			{
-				MethodName: "Delete" + cfg.Singular,
-				Handler:    handler.handleDelete,
-			},
-			{
-				MethodName: "Resume" + cfg.Singular,
-				Handler:    handler.handleResume,
-			},
-		},
-		Streams:  []grpc.StreamDesc{},
-		Metadata: "dynamic/" + strings.ToLower(cfg.Singular[:1]) + cfg.Singular[1:] + "_service.proto",
+		Methods:     methods,
+		Streams:     []grpc.StreamDesc{},
+		Metadata:    "dynamic/" + strings.ToLower(cfg.Singular[:1]) + cfg.Singular[1:] + "_service.proto",
 	}
 
 	return &RegisteredService{
@@ -116,10 +132,14 @@ func Build(cfg *ResourceTypeConfig, deps Deps) (*RegisteredService, error) {
 }
 
 func resolveSpecDescriptor(cfg *ResourceTypeConfig) (protoreflect.MessageDescriptor, error) {
-	if cfg.SpecDescriptor != nil {
-		return cfg.SpecDescriptor, nil
+	mgmt := cfg.Capabilities.Management
+	if mgmt == nil {
+		return nil, fmt.Errorf("management capability is required to resolve a spec descriptor")
 	}
-	desc, err := dynamicapi.CompileFromGlobalRegistry(cfg.SpecMessage)
+	if mgmt.SpecDescriptor != nil {
+		return mgmt.SpecDescriptor, nil
+	}
+	desc, err := dynamicapi.CompileFromGlobalRegistry(mgmt.SpecMessage)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +149,7 @@ func resolveSpecDescriptor(cfg *ResourceTypeConfig) (protoreflect.MessageDescrip
 // dynamicHandler implements the gRPC method handler closures.
 type dynamicHandler struct {
 	cfg        *ResourceTypeConfig
-	descs      *ServiceDescriptors
+	descs      *ExtensionServiceDescriptors
 	resources  *application.ExtensionResourceService
 	validator  protovalidate.Validator
 	collection string
@@ -206,6 +226,11 @@ func (h *dynamicHandler) doCreate(ctx context.Context, req proto.Message) (proto
 		ResourceType: h.cfg.ResourceType,
 		Name:         resourceName,
 		Spec:         json.RawMessage(specJSON),
+	}
+
+	labelsField := h.descs.Resource.Fields().ByName("labels")
+	if labelsField != nil {
+		in.Labels = dynamicapi.ExtractMapStringString(resourceMsg, labelsField)
 	}
 
 	// Field 3: user_signature (optional)
@@ -450,7 +475,7 @@ func (h *dynamicHandler) parseName(name string) (domain.ResourceName, error) {
 // viewToResource converts a domain ExtensionResourceView into a dynamic
 // resource message populated with the platform envelope and addon spec.
 func (h *dynamicHandler) viewToResource(v domain.ExtensionResourceView) (proto.Message, error) {
-	return ViewToResource(h.descs, v)
+	return ViewToResource(h.descs, h.cfg, v)
 }
 
 func stateFromFulfillment(s domain.FulfillmentState) protoreflect.EnumNumber {

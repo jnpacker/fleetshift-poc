@@ -70,6 +70,7 @@ type CreateExtensionResourceInput struct {
 	ResourceType  domain.ResourceType
 	Name          domain.ResourceName
 	Spec          json.RawMessage
+	Labels        map[string]string
 	Provenance    *domain.Provenance
 	UserSignature []byte
 	ValidUntil    time.Time
@@ -147,6 +148,7 @@ func (s *ExtensionResourceService) Create(ctx context.Context, in CreateExtensio
 		ResourceType: in.ResourceType,
 		Name:         in.Name,
 		Spec:         in.Spec,
+		Labels:       in.Labels,
 		TypeDef:      typeDef,
 		Provenance:   prov,
 		Auth:         auth,

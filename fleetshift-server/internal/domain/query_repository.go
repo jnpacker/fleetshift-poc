@@ -29,20 +29,33 @@ const (
 type QueryResourcesRequest struct {
 	// Filter is a CEL expression evaluated against the query result
 	// envelope (see each backend's field resolver for the supported
-	// field set). Empty matches every row.
+	// field set). Empty matches every activated extension type when
+	// the repository's [QuerySchemaProvider] is set; with a nil
+	// provider there is no activation scope.
 	//
-	// Public CEL fields for this iteration are envelope name,
-	// envelope resource_type, and fields under resource (labels,
-	// managed fields, inventory, and guarded spec/observation). Old
-	// POC envelope aliases such as platform_name, kind, service_name,
-	// api_version, collection_name, and resource_id are not supported
-	// filter fields.
+	// Supported CEL fields are envelope name, envelope resource_type,
+	// and fields under resource (labels, managed fields, observed-state
+	// fields such as local_labels/conditions/observation/
+	// local_update_time/index_update_time, and guarded
+	// spec/observation). Top-level identity components
+	// (service_name, collection_name, resource_id, and similar) are
+	// not filter fields; use name / resource_type instead. Other
+	// resource.* paths are rejected as unsupported.
 	//
-	// Ordinary string fields (== and startsWith) are case-sensitive
-	// on every backend. resource.state is the exception: comparisons
-	// and startsWith lowercase string literals so API enum spellings
-	// from Get/List ("ACTIVE") match the lowercase values stored on
-	// fulfillments.state ("active").
+	// String filter matching follows the field's domain case
+	// semantics: case-sensitive when the value is normally treated
+	// that way (e.g. names, labels), and case-folded when the domain
+	// normalizes or constrains the value to a case-insensitive form.
+	// resource.state is one such field today — storage is lowercase
+	// while Get/List may expose uppercase API enum spellings
+	// ("ACTIVE") — so == / != / in / startsWith lowercase string
+	// literals to match. Other fields with the same domain rule
+	// should get the same treatment.
+	//
+	// When a [QuerySchemaProvider] is configured, results are limited
+	// to types it lists (see [ResolveQueryResourceTypeScope]). Named
+	// top-level resource_type == / in constraints must refer to
+	// activated types or the call fails with [ErrInvalidArgument].
 	Filter string
 
 	// PageSize caps the number of rows returned. Non-positive values
@@ -56,9 +69,9 @@ type QueryResourcesRequest struct {
 
 	// OrderBy selects a supported deterministic ordering. Leave empty
 	// for the default order (collection_name, resource_id,
-	// service_name, type_name). The only other supported value in
-	// this iteration is "resource_type,name". Arbitrary expressions
-	// return [ErrInvalidArgument].
+	// service_name, type_name). The only other supported value is
+	// "resource_type,name". Arbitrary expressions return
+	// [ErrInvalidArgument].
 	OrderBy string
 }
 
@@ -77,7 +90,7 @@ type QueryResourcesPage struct {
 type QueryResourceResult struct {
 	// Kind discriminates which of Platform/Extension is populated.
 	// It is implementation metadata for callers that find the
-	// discriminator convenient; it is not part of the target public
+	// discriminator convenient; it is not part of the public
 	// QueryResources response shape, and CEL filters must not select
 	// on it. Prefer resource_type for type selection. The current
 	// implementation always sets Kind to [QueryResourceKindExtension].

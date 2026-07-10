@@ -10,12 +10,12 @@ import (
 	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/domain"
 )
 
-// runHardeningTests exercises the plan's Phase 7 hardening
-// requirements at the repository level (querysql's own unit tests
-// already cover the compiler in isolation): SQL injection attempts in
-// filter string literals must be treated as inert data, and malformed
-// page tokens must fail closed with ErrInvalidArgument rather than
-// panicking or executing unintended SQL.
+// runHardeningTests exercises repository-level hardening: SQL
+// injection attempts in filter string literals must be treated as
+// inert data, and malformed page tokens must fail closed with
+// ErrInvalidArgument rather than panicking or executing unintended
+// SQL. querysql's own unit tests already cover the compiler in
+// isolation.
 func runHardeningTests(t *testing.T, factory Factory) {
 	t.Run("InjectionInLabelValueIsInert", func(t *testing.T) {
 		tx, fx := newFixtureTx(t, factory)
@@ -34,7 +34,7 @@ func runHardeningTests(t *testing.T, factory Factory) {
 			t.Fatalf("seed injection-payload label: %v", err)
 		}
 
-		filter := fmt.Sprintf("resource.inventory.labels[\"node-role\"] == %q", payload)
+		filter := fmt.Sprintf("resource.local_labels[\"node-role\"] == %q", payload)
 		results := queryAll(t, tx, filter)
 		if len(results) != 1 {
 			t.Fatalf("len(results) = %d, want 1 (the payload should match as ordinary data)", len(results))

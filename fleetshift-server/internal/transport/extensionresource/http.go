@@ -1,4 +1,4 @@
-package managedresource
+package extensionresource
 
 import (
 	"io"
@@ -19,10 +19,11 @@ import (
 // given HTTP mux. Routes follow the AIP HTTP binding pattern at the
 // canonical /apis/{service}/{version}/{collection} prefix:
 //
-//	POST   {prefix}          -> Create
-//	GET    {prefix}/{id}     -> Get
-//	GET    {prefix}          -> List
-//	DELETE {prefix}/{id}     -> Delete
+//	POST   {prefix}                 -> Create
+//	GET    {prefix}/{id}            -> Get
+//	GET    {prefix}                 -> List
+//	DELETE {prefix}/{id}            -> Delete
+//	POST   {prefix}/{id}:resume     -> Resume
 //
 // The conn is a gRPC client connection to the server hosting the service.
 //
@@ -51,8 +52,16 @@ func BuildHTTPHandler(svc *RegisteredService, conn *grpc.ClientConn, prefix stri
 
 		switch {
 		case r.Method == http.MethodPost && (rest == "" || rest == "/"):
+			if svc.Descriptors.CreateRequest == nil {
+				http.NotFound(w, r)
+				return
+			}
 			handleHTTPCreate(w, r, conn, svc)
 		case r.Method == http.MethodPost && strings.HasSuffix(rest, ":resume"):
+			if svc.Descriptors.ResumeRequest == nil {
+				http.NotFound(w, r)
+				return
+			}
 			id := strings.TrimPrefix(rest, "/")
 			id = strings.TrimSuffix(id, ":resume")
 			handleHTTPResume(w, r, conn, svc, id)
@@ -62,6 +71,10 @@ func BuildHTTPHandler(svc *RegisteredService, conn *grpc.ClientConn, prefix stri
 			id := strings.TrimPrefix(rest, "/")
 			handleHTTPGet(w, r, conn, svc, id)
 		case r.Method == http.MethodDelete && len(rest) > 1:
+			if svc.Descriptors.DeleteRequest == nil {
+				http.NotFound(w, r)
+				return
+			}
 			id := strings.TrimPrefix(rest, "/")
 			handleHTTPDelete(w, r, conn, svc, id)
 		default:

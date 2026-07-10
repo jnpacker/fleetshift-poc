@@ -222,6 +222,38 @@ func runTypeTests(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("UpdateTypeBackfillsCapabilities", func(t *testing.T) {
+		tx := factory(t)
+		defer tx.Rollback()
+		repo := tx.ExtensionResources()
+		rt := domain.ResourceType("test.fleetshift.io/Widget")
+		def := domain.NewExtensionResourceType(rt, "v1", "widgets", fixedTime)
+		if err := repo.CreateType(ctx, def); err != nil {
+			t.Fatalf("CreateType: %v", err)
+		}
+
+		snap := def.Snapshot()
+		snap.Management = &domain.ManagementTypeSnapshot{
+			Relation: domain.NewRegisteredSelfTarget("widget-addon", "widgets"),
+		}
+		snap.Inventory = &domain.InventoryTypeSnapshot{}
+		snap.UpdatedAt = fixedTime.Add(time.Second)
+		if err := repo.UpdateType(ctx, domain.ExtensionResourceTypeFromSnapshot(snap)); err != nil {
+			t.Fatalf("UpdateType: %v", err)
+		}
+
+		got, err := repo.GetType(ctx, rt)
+		if err != nil {
+			t.Fatalf("GetType: %v", err)
+		}
+		if got.Management() == nil {
+			t.Fatal("Management() is nil after UpdateType backfill")
+		}
+		if got.Inventory() == nil {
+			t.Fatal("Inventory() is nil after UpdateType backfill")
+		}
+	})
+
 	t.Run("CreateTypeWithoutManagement", func(t *testing.T) {
 		tx := factory(t)
 		defer tx.Rollback()

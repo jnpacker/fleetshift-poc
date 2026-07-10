@@ -15,16 +15,14 @@ import (
 // compiler owns CEL AST lowering and knows nothing about any of this
 // -- see querysql's package doc for why the split lands here.
 //
-// Public CEL fields match the target QueryResources response shape:
-// envelope name, envelope resource_type, and fields under resource.
-// Old POC envelope aliases (platform_name, kind, service_name,
-// api_version, collection_name, resource_id) and platform-only body
-// fields are rejected.
+// Public CEL fields match the QueryResources response shape: envelope
+// name, envelope resource_type, and fields under resource. Top-level
+// identity components and platform-only body fields are rejected.
 type queryFieldResolver struct {
-	// SchemaProvider, if set, lets resource.spec.* (and, once
-	// activated, resource.inventory.observation.*) paths be validated
-	// against a real protobuf descriptor when the filter's top-level
-	// resource_type guard resolves to a type with one registered. See
+	// SchemaProvider, if set, lets resource.spec.* and
+	// resource.observation.* paths be validated against a real
+	// protobuf descriptor when the filter's top-level resource_type
+	// guard resolves to a type with one registered. See
 	// [domain.QuerySchemaProvider]'s doc for the absence-of-schema
 	// fallback behavior when this is nil or has nothing registered for
 	// the guarded type.
@@ -33,9 +31,9 @@ type queryFieldResolver struct {
 
 var _ querysql.FieldResolver = queryFieldResolver{}
 
-// conditionSubfields are the resource.inventory.conditions["Type"].*
-// fields the plan documents; all are text-valued so no cast handling
-// is needed for them either.
+// conditionSubfields are the resource.conditions["Type"].* fields
+// supported in filters; all are text-valued so no cast handling is
+// needed for them.
 var conditionSubfields = map[string]bool{
 	"status":             true,
 	"reason":             true,
@@ -103,7 +101,8 @@ func (r queryFieldResolver) resolveResourceField(segs []string, want querysql.Ty
 	case "name":
 		if len(rest) == 0 {
 			// Body-level relative resource name
-			// (collection_name/resource_id), not an envelope alias.
+			// (collection_name/resource_id), distinct from the
+			// envelope's full name.
 			return querysql.SQLExpr{SQL: "er.collection_name || '/' || er.resource_id"}, nil
 		}
 	case "uid":
@@ -120,9 +119,9 @@ func (r queryFieldResolver) resolveResourceField(segs []string, want querysql.Ty
 		}
 	case "state":
 		if len(rest) == 0 {
-			// fulfillments.state is stored lowercase; lowercase string
-			// literals so API enum spellings ("ACTIVE") match for
-			// == / != / in / startsWith.
+			// Domain value is case-insensitive / stored lowercase;
+			// fold filter literals so API enum spellings ("ACTIVE")
+			// match for == / != / in / startsWith.
 			return querysql.SQLExpr{
 				SQL:        "f.state",
 				Compare:    querysql.LowercaseStringCompare("f.state"),
@@ -140,33 +139,13 @@ func (r queryFieldResolver) resolveResourceField(segs []string, want querysql.Ty
 		}
 	case "spec":
 		if len(rest) > 0 {
-			if ctx.GuardedResourceType == nil {
-				return querysql.SQLExpr{}, fmt.Errorf(
-					"filter: %w: resource.spec.* requires a top-level resource_type == \"...\" conjunct",
-					domain.ErrInvalidArgument)
-			}
 			names, err := r.validateSpecPath(ctx, rest)
 			if err != nil {
 				return querysql.SQLExpr{}, err
 			}
 			return jsonTextField("ri.spec", names, want)
 		}
-	case "inventory":
-		return r.resolveInventoryField(rest, want, ctx)
-	case "effective_labels", "representations", "aliases", "relationships":
-		return querysql.SQLExpr{}, fmt.Errorf("filter: %w: unsupported field \"resource.%s\"", domain.ErrInvalidArgument, strings.Join(segs, "."))
-	}
-	return querysql.SQLExpr{}, fmt.Errorf("filter: %w: unsupported field \"resource.%s\"", domain.ErrInvalidArgument, strings.Join(segs, "."))
-}
-
-func (r queryFieldResolver) resolveInventoryField(segs []string, want querysql.TypeHint, ctx querysql.ResolveContext) (querysql.SQLExpr, error) {
-	if len(segs) == 0 {
-		return querysql.SQLExpr{}, fmt.Errorf("filter: %w: unsupported field \"resource.inventory\"", domain.ErrInvalidArgument)
-	}
-
-	head, rest := segs[0], segs[1:]
-	switch head {
-	case "labels":
+	case "local_labels":
 		if len(rest) == 1 {
 			return labelField("inv.labels", rest[0], ctx.Bind, want), nil
 		}
@@ -182,23 +161,26 @@ func (r queryFieldResolver) resolveInventoryField(segs []string, want querysql.T
 		}
 	case "observation":
 		if len(rest) > 0 {
-			if ctx.GuardedResourceType == nil {
-				return querysql.SQLExpr{}, fmt.Errorf(
-					"filter: %w: resource.inventory.observation.* requires a top-level resource_type == \"...\" conjunct",
-					domain.ErrInvalidArgument)
-			}
 			names, err := r.validateObservationPath(ctx, rest)
 			if err != nil {
 				return querysql.SQLExpr{}, err
 			}
 			return jsonTextField("inv.observation", names, want)
 		}
+	case "local_update_time":
+		if len(rest) == 0 {
+			return querysql.SQLExpr{SQL: "inv.observed_at"}, nil
+		}
+	case "index_update_time":
+		if len(rest) == 0 {
+			return querysql.SQLExpr{SQL: "inv.updated_at"}, nil
+		}
 	}
-	return querysql.SQLExpr{}, fmt.Errorf("filter: %w: unsupported field \"resource.inventory.%s\"", domain.ErrInvalidArgument, strings.Join(segs, "."))
+	return querysql.SQLExpr{}, fmt.Errorf("filter: %w: unsupported field \"resource.%s\"", domain.ErrInvalidArgument, strings.Join(segs, "."))
 }
 
 // labelField handles the common `<column> ->> <key>` shape shared by
-// resource.labels[...] and resource.inventory.labels[...]. key comes
+// resource.labels[...] and resource.local_labels[...]. key comes
 // from the filter text (a CEL map-index string literal), so it is
 // bound as a SQL parameter via bind rather than inlined. String
 // equality is rewritten to JSONB containment so the GIN indexes can
@@ -335,8 +317,8 @@ func inFullName(values []any, bind func(any) string) (string, bool, error) {
 
 // jsonTextField builds a chained ->/->> extraction from column
 // through names -- the parsed dotted-path field names from a
-// resource.spec.foo.bar/resource.inventory.observation.foo.bar
-// selector -- and casts the result per want (see castByHint).
+// resource.spec.foo.bar/resource.observation.foo.bar selector -- and
+// casts the result per want (see castByHint).
 func jsonTextField(column string, names []string, want querysql.TypeHint) (querysql.SQLExpr, error) {
 	for _, n := range names {
 		if !identifierPattern.MatchString(n) {

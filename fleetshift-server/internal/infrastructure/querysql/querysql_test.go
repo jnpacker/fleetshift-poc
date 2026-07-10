@@ -51,19 +51,6 @@ func compileErr(t *testing.T, filter string) error {
 	return err
 }
 
-func TestCompileFilter_Empty(t *testing.T) {
-	pred := compile(t, "")
-	if pred.SQL != "TRUE" {
-		t.Errorf("SQL = %q, want TRUE", pred.SQL)
-	}
-	if len(pred.Args) != 0 {
-		t.Errorf("Args = %v, want empty", pred.Args)
-	}
-}
-
-// TestCompileFilter_ConcurrentSharedCompiler proves a single Compiler
-// (and its shared CEL env) can CompileFilter from many goroutines at
-// once. Run with -race.
 func TestCompileFilter_ConcurrentSharedCompiler(t *testing.T) {
 	c := querysql.Compiler{Fields: stubResolver{}}
 	filters := []string{
@@ -435,10 +422,9 @@ func TestCompileFilter_InEmptyListStillResolvesField(t *testing.T) {
 func TestCompileFilter_GuardInsideOrDoesNotCount(t *testing.T) {
 	// The resource_type guard only counts when it's a top-level `&&`
 	// conjunct; inside an `||` branch it doesn't establish the type
-	// for the whole expression. This is exercised here via
-	// GuardedResourceType directly, since guard *detection* is this
-	// package's job even though what a guard *licenses* is the
-	// resolver's.
+	// for optional schema validation of the whole expression. Spec
+	// paths still compile without a guard; this test only checks
+	// guard *detection*.
 	var gotGuard *domain.ResourceType
 	c := querysql.Compiler{Fields: recordingResolver(func(_ querysql.FieldPath, _ querysql.TypeHint, ctx querysql.ResolveContext) (querysql.SQLExpr, error) {
 		gotGuard = ctx.GuardedResourceType

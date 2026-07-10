@@ -56,6 +56,34 @@ func (r *ExtensionResourceRepo) CreateType(ctx context.Context, def domain.Exten
 	return nil
 }
 
+func (r *ExtensionResourceRepo) UpdateType(ctx context.Context, def domain.ExtensionResourceType) error {
+	snap := def.Snapshot()
+	mgmtJSON, err := marshalManagementSnapshot(snap.Management)
+	if err != nil {
+		return fmt.Errorf("marshal management: %w", err)
+	}
+	var invJSON sql.NullString
+	if snap.Inventory != nil {
+		invJSON = sql.NullString{String: "{}", Valid: true}
+	}
+	res, err := r.DB.ExecContext(ctx,
+		`UPDATE extension_resource_types
+		 SET management = $1, inventory = $2, updated_at = $3
+		 WHERE service_name = $4 AND type_name = $5`,
+		nullStringFromBytes(mgmtJSON),
+		invJSON,
+		snap.UpdatedAt.UTC(),
+		string(snap.ResourceType.ServiceName()), snap.ResourceType.TypeName())
+	if err != nil {
+		return fmt.Errorf("update extension resource type: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: resource type %q", domain.ErrNotFound, snap.ResourceType)
+	}
+	return nil
+}
+
 func (r *ExtensionResourceRepo) GetType(ctx context.Context, rt domain.ResourceType) (domain.ExtensionResourceType, error) {
 	row := r.DB.QueryRowContext(ctx,
 		`SELECT service_name, type_name, api_version, collection_id, management, inventory, created_at, updated_at
