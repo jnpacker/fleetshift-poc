@@ -202,6 +202,8 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			eventHub,
 		)),
 	)
+	inventoryReportService := application.NewInventoryReportService(store)
+	inventoryReporter := application.NewInventoryReporterAdapter(inventoryReportService)
 
 	// --- construct addon agents ---
 	//
@@ -214,6 +216,7 @@ func runServe(ctx context.Context, f *serveFlags) error {
 	if enabledAddons["kind"] {
 		kindOpts := []kindaddon.AgentOption{
 			kindaddon.WithObserver(kindaddon.NewSlogAgentObserver(logger)),
+			kindaddon.WithInventoryWatcher(kindaddon.NewInventoryWatcher(inventoryReporter)),
 		}
 		if oidcCABundle != nil {
 			kindOpts = append(kindOpts, kindaddon.WithOIDCCABundle(oidcCABundle))
@@ -345,6 +348,7 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		}
 		pool.AppendCertsFromPEM(oidcCABundle)
 		oidcHTTPClient = &http.Client{
+			Timeout: 5 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{RootCAs: pool},
 			},
@@ -658,9 +662,9 @@ func runServe(ctx context.Context, f *serveFlags) error {
 				domain.TargetStateReady,
 				nil,
 				nil,
-				[]domain.ManifestType{kindaddon.ClusterManifestType, domain.TrustBundleManifestType},
+				[]domain.ManifestType{kindaddon.ClusterManifestType, kindaddon.ManagedClusterManifestType, domain.TrustBundleManifestType},
 			)},
-			Schemas: []domain.ExtensionResourceSchema{kindaddon.Schema()},
+			Schemas: []domain.ExtensionResourceSchema{kindaddon.Schema(), kindaddon.NodeSchema()},
 		}); err != nil {
 			return fmt.Errorf("connect kind addon: %w", err)
 		}

@@ -1281,7 +1281,7 @@ func runInventoryTests(t *testing.T, factory Factory) {
 	})
 
 	t.Run("Delta", func(t *testing.T) {
-		t.Run("SetsAndDeletesLabelsWithoutTouchingUnrelated", func(t *testing.T) {
+		t.Run("ReplacesAndDeletesLabels", func(t *testing.T) {
 			tx := factory(t)
 			defer tx.Rollback()
 			repo := tx.ExtensionResources()
@@ -1297,7 +1297,7 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			t1 := fixedTime.Add(time.Minute)
 			if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
 				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
-				Labels:     map[string]string{"zone": "us-east-1", "tier": "1"},
+				Labels:     map[string]string{"zone": "us-east-1", "tier": "1", "keep": "yes"},
 				ObservedAt: t1,
 				ReceivedAt: t1,
 			}}); err != nil {
@@ -1307,12 +1307,11 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			t2 := fixedTime.Add(2 * time.Minute)
 			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
 				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
-				SetLabels:    map[string]string{"zone": "us-west-2"},
-				DeleteLabels: []string{"tier"},
-				ObservedAt:   t2,
-				ReceivedAt:   t2,
+				ReplaceLabels: map[string]string{"zone": "us-west-2", "keep": "yes"},
+				ObservedAt:    t2,
+				ReceivedAt:    t2,
 			}}); err != nil {
-				t.Fatalf("ApplyInventoryDeltas: %v", err)
+				t.Fatalf("ReplaceLabels ApplyInventoryDeltas: %v", err)
 			}
 
 			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-labels")
@@ -1321,8 +1320,206 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			}
 			labels := view.Resource.Inventory().Labels()
 			assertEqual(t, "Labels[zone]", labels["zone"], "us-west-2")
+			assertEqual(t, "Labels[keep]", labels["keep"], "yes")
+			if _, ok := labels["tier"]; ok {
+				t.Errorf("Labels[tier] = %q, want absent after ReplaceLabels", labels["tier"])
+			}
+
+			t3 := fixedTime.Add(3 * time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				DeleteLabels: []string{"keep"},
+				ObservedAt:   t3,
+				ReceivedAt:   t3,
+			}}); err != nil {
+				t.Fatalf("DeleteLabels ApplyInventoryDeltas: %v", err)
+			}
+
+			view, err = repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-labels")
+			if err != nil {
+				t.Fatalf("GetView after DeleteLabels: %v", err)
+			}
+			labels = view.Resource.Inventory().Labels()
+			assertEqual(t, "Labels[zone]", labels["zone"], "us-west-2")
+			if _, ok := labels["keep"]; ok {
+				t.Errorf("Labels[keep] = %q, want deleted", labels["keep"])
+			}
+		})
+
+		t.Run("UpsertsAndDeletesLabelsLeavingOmittedUntouched", func(t *testing.T) {
+			tx := factory(t)
+			defer tx.Rollback()
+			repo := tx.ExtensionResources()
+
+			if err := repo.CreateType(ctx, sampleInventoryType("inv.fleetshift.io/Node")); err != nil {
+				t.Fatalf("CreateType: %v", err)
+			}
+			r := newInventoryER("inv.fleetshift.io/Node", "nodes/delta-labels-upsert")
+			if err := repo.Create(ctx, r); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			t1 := fixedTime.Add(time.Minute)
+			if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				Labels:     map[string]string{"zone": "us-east-1", "tier": "1", "keep": "yes"},
+				ObservedAt: t1, ReceivedAt: t1,
+			}}); err != nil {
+				t.Fatalf("seed ReplaceInventory: %v", err)
+			}
+
+			t2 := fixedTime.Add(2 * time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				UpsertLabels: map[string]string{"zone": "us-west-2", "env": "prod"},
+				DeleteLabels: []string{"tier"},
+				ObservedAt:   t2, ReceivedAt: t2,
+			}}); err != nil {
+				t.Fatalf("UpsertLabels/DeleteLabels ApplyInventoryDeltas: %v", err)
+			}
+
+			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-labels-upsert")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			labels := view.Resource.Inventory().Labels()
+			assertEqual(t, "Labels[zone]", labels["zone"], "us-west-2")
+			assertEqual(t, "Labels[env]", labels["env"], "prod")
+			assertEqual(t, "Labels[keep]", labels["keep"], "yes")
 			if _, ok := labels["tier"]; ok {
 				t.Errorf("Labels[tier] = %q, want deleted", labels["tier"])
+			}
+			if got := len(labels); got != 3 {
+				t.Errorf("Labels len = %d, want 3", got)
+			}
+		})
+
+		t.Run("EmptyReplaceLabelsClearsAll", func(t *testing.T) {
+			tx := factory(t)
+			defer tx.Rollback()
+			repo := tx.ExtensionResources()
+
+			if err := repo.CreateType(ctx, sampleInventoryType("inv.fleetshift.io/Node")); err != nil {
+				t.Fatalf("CreateType: %v", err)
+			}
+			r := newInventoryER("inv.fleetshift.io/Node", "nodes/delta-labels-clear")
+			if err := repo.Create(ctx, r); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			t1 := fixedTime.Add(time.Minute)
+			if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				Labels:     map[string]string{"zone": "us-east-1"},
+				ObservedAt: t1, ReceivedAt: t1,
+			}}); err != nil {
+				t.Fatalf("seed ReplaceInventory: %v", err)
+			}
+
+			t2 := fixedTime.Add(2 * time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				ReplaceLabels: map[string]string{},
+				ObservedAt:    t2, ReceivedAt: t2,
+			}}); err != nil {
+				t.Fatalf("ApplyInventoryDeltas: %v", err)
+			}
+
+			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-labels-clear")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			if got := len(view.Resource.Inventory().Labels()); got != 0 {
+				t.Errorf("Labels len = %d, want 0 after empty ReplaceLabels", got)
+			}
+		})
+
+		t.Run("ReplacesConditions", func(t *testing.T) {
+			tx := factory(t)
+			defer tx.Rollback()
+			repo := tx.ExtensionResources()
+
+			if err := repo.CreateType(ctx, sampleInventoryType("inv.fleetshift.io/Node")); err != nil {
+				t.Fatalf("CreateType: %v", err)
+			}
+			r := newInventoryER("inv.fleetshift.io/Node", "nodes/delta-replace-conds")
+			if err := repo.Create(ctx, r); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			t1 := fixedTime.Add(time.Minute)
+			if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				Conditions: []domain.Condition{
+					mustCondition(t, "Ready", domain.ConditionTrue, "AllGood", "ok", t1),
+					mustCondition(t, "Healthy", domain.ConditionTrue, "Nominal", "", t1),
+				},
+				ObservedAt: t1, ReceivedAt: t1,
+			}}); err != nil {
+				t.Fatalf("seed ReplaceInventory: %v", err)
+			}
+
+			t2 := fixedTime.Add(2 * time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				ReplaceConditions: []domain.Condition{
+					mustCondition(t, "Ready", domain.ConditionFalse, "Degraded", "broke", t2),
+				},
+				ObservedAt: t2, ReceivedAt: t2,
+			}}); err != nil {
+				t.Fatalf("ApplyInventoryDeltas: %v", err)
+			}
+
+			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-replace-conds")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			conds := view.Resource.Inventory().Conditions()
+			if len(conds) != 1 {
+				t.Fatalf("Conditions len = %d, want 1 after ReplaceConditions", len(conds))
+			}
+			if conds[0].Type() != "Ready" || conds[0].Status() != domain.ConditionFalse {
+				t.Errorf("Conditions[0] = %+v, want Ready=False", conds[0])
+			}
+		})
+
+		t.Run("EmptyReplaceConditionsClearsAll", func(t *testing.T) {
+			tx := factory(t)
+			defer tx.Rollback()
+			repo := tx.ExtensionResources()
+
+			if err := repo.CreateType(ctx, sampleInventoryType("inv.fleetshift.io/Node")); err != nil {
+				t.Fatalf("CreateType: %v", err)
+			}
+			r := newInventoryER("inv.fleetshift.io/Node", "nodes/delta-conds-clear")
+			if err := repo.Create(ctx, r); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			t1 := fixedTime.Add(time.Minute)
+			if err := repo.ReplaceInventory(ctx, []domain.InventoryReplacement{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				Conditions: []domain.Condition{mustCondition(t, "Ready", domain.ConditionTrue, "AllGood", "ok", t1)},
+				ObservedAt: t1, ReceivedAt: t1,
+			}}); err != nil {
+				t.Fatalf("seed ReplaceInventory: %v", err)
+			}
+
+			t2 := fixedTime.Add(2 * time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				ReplaceConditions: []domain.Condition{},
+				ObservedAt:        t2, ReceivedAt: t2,
+			}}); err != nil {
+				t.Fatalf("ApplyInventoryDeltas: %v", err)
+			}
+
+			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-conds-clear")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			if got := len(view.Resource.Inventory().Conditions()); got != 0 {
+				t.Errorf("Conditions len = %d, want 0 after empty ReplaceConditions", got)
 			}
 		})
 
@@ -1353,10 +1550,10 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			t2 := fixedTime.Add(2 * time.Minute)
 			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
 				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
-				SetLabels:   map[string]string{"zone": "us-east-1"},
-				Observation: nil,
-				ObservedAt:  t2,
-				ReceivedAt:  t2,
+				ReplaceLabels: map[string]string{"zone": "us-east-1"},
+				Observation:   nil,
+				ObservedAt:    t2,
+				ReceivedAt:    t2,
 			}}); err != nil {
 				t.Fatalf("ApplyInventoryDeltas: %v", err)
 			}
@@ -1583,22 +1780,16 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			}
 		})
 
-		// RejectsLabelInBothSetAndDelete/RejectsConditionInBothUpsertAndDelete
-		// guard an invariant [InventoryReportService]'s
-		// validateDeltaReport also checks before identity resolution
-		// even begins -- but that's an application-layer courtesy,
-		// not a substitute for the repository defending its own
-		// contract against a delta built any other way. The two
-		// backends' applyInventoryDeltasCoreCTEs/ApplyInventoryDeltas
-		// implementations have no defined ordering between a field's
-		// set/upsert and its delete when both target the same
-		// key/type in one delta (Postgres's sibling writable CTEs
-		// touching the same table have no guaranteed execution order;
-		// SQLite's sequential statements would happen to let the
-		// delete win, but only incidentally) -- so without this
-		// check, the very same contradictory delta could silently
-		// resolve differently per backend.
-		t.Run("RejectsLabelInBothSetAndDelete", func(t *testing.T) {
+		// RejectsReplaceLabelsWithIncremental /
+		// RejectsReplaceConditionsWithIncremental guard mutual
+		// exclusion between full-replace and incremental ops on the
+		// same field. RejectsLabelInBothUpsertAndDelete /
+		// RejectsConditionInBothUpsertAndDelete still cover the
+		// incremental-only overlap case. The application layer's
+		// validateDeltaReport also checks these before identity
+		// resolution -- but that's a courtesy, not a substitute for
+		// the repository defending its own contract.
+		t.Run("RejectsReplaceLabelsWithIncremental", func(t *testing.T) {
 			tx := factory(t)
 			defer tx.Rollback()
 			repo := tx.ExtensionResources()
@@ -1613,8 +1804,8 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			t1 := fixedTime.Add(time.Minute)
 			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
 				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
-				SetLabels:  map[string]string{"zone": "us-east-1"},
-				ObservedAt: t1, ReceivedAt: t1,
+				ReplaceLabels: map[string]string{"zone": "us-east-1"},
+				ObservedAt:    t1, ReceivedAt: t1,
 			}}); err != nil {
 				t.Fatalf("seed ApplyInventoryDeltas: %v", err)
 			}
@@ -1622,12 +1813,23 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			t2 := fixedTime.Add(2 * time.Minute)
 			err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
 				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
-				SetLabels:    map[string]string{"zone": "us-west-2"},
-				DeleteLabels: []string{"zone"},
-				ObservedAt:   t2, ReceivedAt: t2,
+				ReplaceLabels: map[string]string{"zone": "us-west-2"},
+				DeleteLabels:  []string{"zone"},
+				ObservedAt:    t2, ReceivedAt: t2,
 			}})
 			if !errors.Is(err, domain.ErrInvalidArgument) {
 				t.Fatalf("ApplyInventoryDeltas err = %v, want ErrInvalidArgument", err)
+			}
+
+			t3 := fixedTime.Add(3 * time.Minute)
+			err = repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				ReplaceLabels: map[string]string{"zone": "us-west-2"},
+				UpsertLabels:  map[string]string{"tier": "1"},
+				ObservedAt:    t3, ReceivedAt: t3,
+			}})
+			if !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Fatalf("ApplyInventoryDeltas (Replace+Upsert) err = %v, want ErrInvalidArgument", err)
 			}
 
 			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-label-contradiction")
@@ -1636,6 +1838,89 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			}
 			if got := view.Resource.Inventory().Labels()["zone"]; got != "us-east-1" {
 				t.Errorf("Labels[zone] = %q, want unchanged %q (rejected before any write)", got, "us-east-1")
+			}
+		})
+
+		t.Run("RejectsLabelInBothUpsertAndDelete", func(t *testing.T) {
+			tx := factory(t)
+			defer tx.Rollback()
+			repo := tx.ExtensionResources()
+
+			if err := repo.CreateType(ctx, sampleInventoryType("inv.fleetshift.io/Node")); err != nil {
+				t.Fatalf("CreateType: %v", err)
+			}
+			r := newInventoryER("inv.fleetshift.io/Node", "nodes/delta-label-upsert-delete")
+			if err := repo.Create(ctx, r); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			t1 := fixedTime.Add(time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				UpsertLabels: map[string]string{"zone": "us-east-1"},
+				ObservedAt:   t1, ReceivedAt: t1,
+			}}); err != nil {
+				t.Fatalf("seed ApplyInventoryDeltas: %v", err)
+			}
+
+			t2 := fixedTime.Add(2 * time.Minute)
+			err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				UpsertLabels: map[string]string{"zone": "us-west-2"},
+				DeleteLabels: []string{"zone"},
+				ObservedAt:   t2, ReceivedAt: t2,
+			}})
+			if !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Fatalf("ApplyInventoryDeltas err = %v, want ErrInvalidArgument", err)
+			}
+
+			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-label-upsert-delete")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			if got := view.Resource.Inventory().Labels()["zone"]; got != "us-east-1" {
+				t.Errorf("Labels[zone] = %q, want unchanged %q (rejected before any write)", got, "us-east-1")
+			}
+		})
+
+		t.Run("RejectsReplaceConditionsWithIncremental", func(t *testing.T) {
+			tx := factory(t)
+			defer tx.Rollback()
+			repo := tx.ExtensionResources()
+
+			if err := repo.CreateType(ctx, sampleInventoryType("inv.fleetshift.io/Node")); err != nil {
+				t.Fatalf("CreateType: %v", err)
+			}
+			r := newInventoryER("inv.fleetshift.io/Node", "nodes/delta-replace-cond-contradiction")
+			if err := repo.Create(ctx, r); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			t1 := fixedTime.Add(time.Minute)
+			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				ReplaceConditions: []domain.Condition{mustCondition(t, "Ready", domain.ConditionTrue, "AllGood", "ok", t1)},
+				ObservedAt:        t1, ReceivedAt: t1,
+			}}); err != nil {
+				t.Fatalf("seed ApplyInventoryDeltas: %v", err)
+			}
+
+			t2 := fixedTime.Add(2 * time.Minute)
+			err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
+				ResourceType: r.ResourceType(), Name: r.Name(), CandidateUID: domain.NewExtensionResourceUID(),
+				ReplaceConditions: []domain.Condition{mustCondition(t, "Ready", domain.ConditionFalse, "Degraded", "broke", t2)},
+				DeleteConditions:  []domain.ConditionType{"Ready"},
+				ObservedAt:        t2, ReceivedAt: t2,
+			}})
+			if !errors.Is(err, domain.ErrInvalidArgument) {
+				t.Fatalf("ApplyInventoryDeltas err = %v, want ErrInvalidArgument", err)
+			}
+
+			view, err := repo.GetView(ctx, "//inv.fleetshift.io/nodes/delta-replace-cond-contradiction")
+			if err != nil {
+				t.Fatalf("GetView: %v", err)
+			}
+			conds := view.Resource.Inventory().Conditions()
+			if len(conds) != 1 || conds[0].Status() != domain.ConditionTrue {
+				t.Errorf("Conditions = %+v, want unchanged [Ready=True] (rejected before any write)", conds)
 			}
 		})
 
@@ -2456,11 +2741,11 @@ func runInventoryTests(t *testing.T, factory Factory) {
 			name := domain.ResourceName("nodes/delta-created-alias-payload")
 			t1 := fixedTime.Add(time.Minute)
 			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
-				ResourceType: "inv.fleetshift.io/Node",
-				Name:         name,
-				CandidateUID: domain.NewExtensionResourceUID(),
-				SetLabels:    map[string]string{"env": "prod"},
-				ObservedAt:   t1, ReceivedAt: t1,
+				ResourceType:  "inv.fleetshift.io/Node",
+				Name:          name,
+				CandidateUID:  domain.NewExtensionResourceUID(),
+				ReplaceLabels: map[string]string{"env": "prod"},
+				ObservedAt:    t1, ReceivedAt: t1,
 			}}); err != nil {
 				t.Fatalf("ApplyInventoryDeltas: %v", err)
 			}
@@ -2906,12 +3191,12 @@ func runInventoryTests(t *testing.T, factory Factory) {
 
 			t2 := fixedTime.Add(2 * time.Minute)
 			if err := repo.ApplyInventoryDeltas(ctx, []domain.InventoryDelta{{
-				ResourceType: "inv.fleetshift.io/Node",
-				Name:         name,
-				CandidateUID: domain.NewExtensionResourceUID(),
-				SetLabels:    map[string]string{"zone": "us-east-1"},
-				ObservedAt:   t2,
-				ReceivedAt:   t2,
+				ResourceType:  "inv.fleetshift.io/Node",
+				Name:          name,
+				CandidateUID:  domain.NewExtensionResourceUID(),
+				ReplaceLabels: map[string]string{"zone": "us-east-1"},
+				ObservedAt:    t2,
+				ReceivedAt:    t2,
 			}}); err != nil {
 				t.Fatalf("label-only ApplyInventoryDeltas: %v", err)
 			}
