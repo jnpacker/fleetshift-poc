@@ -981,8 +981,21 @@ func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacemen
 	if len(replacements) == 0 {
 		return nil
 	}
+	if err := domain.ValidateInventoryReplacements(replacements); err != nil {
+		return err
+	}
 
-	n := len(replacements)
+	deletes, upserts := partitionInventoryReplacements(replacements)
+	if len(deletes) > 0 {
+		if err := r.deleteInventoryReplacements(ctx, deletes); err != nil {
+			return fmt.Errorf("replace inventory: %w", err)
+		}
+	}
+	if len(upserts) == 0 {
+		return nil
+	}
+
+	n := len(upserts)
 	idx := make([]int32, n)
 	serviceNames := make([]string, n)
 	typeNames := make([]string, n)
@@ -996,7 +1009,7 @@ func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacemen
 	receivedAts := make([]time.Time, n)
 	reportedAliases := make([]string, n)
 
-	for i, rep := range replacements {
+	for i, rep := range upserts {
 		idx[i] = int32(i)
 		serviceNames[i] = string(rep.ResourceType.ServiceName())
 		typeNames[i] = rep.ResourceType.TypeName()
@@ -1035,6 +1048,20 @@ func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacemen
 		return fmt.Errorf("replace inventory: %w", err)
 	}
 	return nil
+}
+
+// partitionInventoryReplacements splits a validated mixed batch into
+// IsDelete entries and upserts, preserving relative order within each
+// partition.
+func partitionInventoryReplacements(replacements []domain.InventoryReplacement) (deletes, upserts []domain.InventoryReplacement) {
+	for _, rep := range replacements {
+		if rep.IsDelete {
+			deletes = append(deletes, rep)
+			continue
+		}
+		upserts = append(upserts, rep)
+	}
+	return deletes, upserts
 }
 
 // applyInventoryDeltasSQL implements the field-level counterpart of
@@ -1377,6 +1404,101 @@ func (r *ExtensionResourceRepo) ApplyInventoryDeltas(ctx context.Context, deltas
 	)
 	if err != nil {
 		return fmt.Errorf("apply inventory deltas: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Inventory hard-delete (IsDelete replacements)
+// ---------------------------------------------------------------------------
+
+// inventoryDeleteWithAliasCleanupSQLTemplate is the shared CTE tail
+// factored out of [extensionResourceDeleteWithAliasCleanupSQL]: %s
+// supplies the target_er body, which need only select the uids of the
+// extension_resources rows to delete. See that const's doc comment for
+// the full explanation of why claim cleanup needs old_contributions/
+// touched_claims/baseline_contrib_counts/net_refcount_deltas/
+// remaining_refs rather than a simpler DELETE ... RETURNING, and why
+// the ordering-forcing "(SELECT count(*) FROM deleted_extension_resource) >= 0"
+// clause exists. Unlike that const, target_er here selects only uid --
+// [ExtensionResourceRepo.deleteInventoryReplacements] supplies the
+// selection predicate instead of sharing one exact-name match, and
+// zero matching rows is success, not [domain.ErrNotFound].
+const inventoryDeleteWithAliasCleanupSQLTemplate = `
+WITH target_er AS (
+	%s
+),
+old_contributions AS (
+	SELECT c.claim_id
+	FROM target_er t
+	JOIN resource_alias_contributions c ON c.source_extension_resource_uid = t.uid
+),
+touched_claims AS (
+	SELECT DISTINCT claim_id FROM old_contributions
+),
+baseline_contrib_counts AS (
+	SELECT tc.claim_id, cc.baseline_ct
+	FROM touched_claims tc
+	JOIN LATERAL (
+		SELECT count(*)::bigint AS baseline_ct
+		FROM resource_alias_contributions c
+		WHERE c.claim_id = tc.claim_id
+	) cc ON true
+),
+deleted_extension_resource AS (
+	DELETE FROM extension_resources
+	WHERE uid IN (SELECT uid FROM target_er)
+	RETURNING uid
+),
+net_refcount_deltas AS (
+	SELECT claim_id, -count(*)::bigint AS delta_refs
+	FROM old_contributions
+	GROUP BY claim_id
+),
+remaining_refs AS (
+	SELECT tc.claim_id,
+	       COALESCE(bcc.baseline_ct, 0) + COALESCE(nrd.delta_refs, 0) AS net_refs
+	FROM touched_claims tc
+	LEFT JOIN baseline_contrib_counts bcc ON bcc.claim_id = tc.claim_id
+	LEFT JOIN net_refcount_deltas nrd ON nrd.claim_id = tc.claim_id
+),
+deleted_orphan_claims AS (
+	DELETE FROM resource_alias_claims cl
+	USING remaining_refs rr
+	WHERE cl.id = rr.claim_id
+	  AND rr.net_refs = 0
+	  AND NOT cl.platform_owned
+	  AND (SELECT count(*) FROM deleted_extension_resource) >= 0
+	RETURNING 1
+)
+SELECT (SELECT count(*) FROM deleted_extension_resource)`
+
+// deleteInventoryReplacements hard-deletes every IsDelete replacement
+// by full resource type (service_name + type_name) and name. Missing
+// rows are success; CandidateUID is never consulted.
+func (r *ExtensionResourceRepo) deleteInventoryReplacements(ctx context.Context, deletes []domain.InventoryReplacement) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+	n := len(deletes)
+	serviceNames := make([]string, n)
+	typeNames := make([]string, n)
+	collectionNames := make([]string, n)
+	resourceIDs := make([]string, n)
+	for i, rep := range deletes {
+		serviceNames[i] = string(rep.ResourceType.ServiceName())
+		typeNames[i] = rep.ResourceType.TypeName()
+		collectionNames[i] = string(rep.Name.Collection())
+		resourceIDs[i] = string(rep.Name.ID())
+	}
+	targetEr := `SELECT er.uid
+		FROM extension_resources er
+		JOIN (SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[]) AS t(service_name, type_name, collection_name, resource_id)) t
+		  ON er.service_name = t.service_name AND er.type_name = t.type_name AND er.collection_name = t.collection_name AND er.resource_id = t.resource_id`
+	query := fmt.Sprintf(inventoryDeleteWithAliasCleanupSQLTemplate, targetEr)
+	_, err := r.DB.ExecContext(ctx, query, serviceNames, typeNames, collectionNames, resourceIDs)
+	if err != nil {
+		return fmt.Errorf("delete inventory replacements: %w", err)
 	}
 	return nil
 }

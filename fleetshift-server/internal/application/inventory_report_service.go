@@ -88,22 +88,32 @@ type InventoryReplacementBatchInput struct {
 	Reports []InventoryReplacementInput
 }
 
-// InventoryReplacementInput describes the complete latest inventory
-// state for a single extension resource, identified by resource type
-// plus name and/or aliases (never by [domain.ExtensionResourceUID]).
+// InventoryReplacementInput describes either the complete latest
+// inventory state for a single extension resource, or an exact-name
+// whole-resource delete, identified by resource type plus name and/or
+// aliases (never by [domain.ExtensionResourceUID]).
 //
-// Labels is the complete observed label set; nil and empty both
-// normalize to an empty latest label set. Conditions is the complete
-// current condition set -- conditions absent from the report are
-// deleted from latest state. Observation is the exception to that
-// rule: nil, or non-nil pointing to the JSON literal null, leaves the
-// latest observation untouched; any other non-nil value replaces the
-// latest observation. Neither case appends a history row today -- see
+// When IsDelete is false, Labels is the complete observed label set;
+// nil and empty both normalize to an empty latest label set.
+// Conditions is the complete current condition set -- conditions
+// absent from the report are deleted from latest state. Observation is
+// the exception to that rule: nil, or non-nil pointing to the JSON
+// literal null, leaves the latest observation untouched; any other
+// non-nil value replaces the latest observation. Neither case appends
+// a history row today -- see
 // [domain.ExtensionResourceRepository.ListObservations]'s doc.
+//
+// When IsDelete is true, Name and ResourceType are required (no
+// alias-only identity), payload fields must be empty, and the type
+// must be inventory-only (inventory metadata, no management
+// metadata). See [InventoryReportService.ReplaceBatch].
 type InventoryReplacementInput struct {
 	ResourceType domain.ResourceType
 	Name         *domain.ResourceName
 	Aliases      domain.AliasSet
+	// IsDelete marks this entry as a whole-resource hard delete rather
+	// than an inventory replacement. See this type's doc.
+	IsDelete bool
 
 	Labels      map[string]string
 	Observation *json.RawMessage
@@ -165,20 +175,37 @@ type InventoryDeltaInput struct {
 // by-Name report, or via one batched alias lookup for an alias-only
 // report -- then replaces each resolved resource's latest inventory
 // state, using each command's already-canonical [domain.AliasSet]
-// directly. The batch is all-or-nothing: a duplicate resolved
-// [domain.ResourceName]
-// within the batch, a type without inventory metadata, or an
-// unresolvable/ambiguous alias-only report fails the whole call
-// before any inventory write commits, regardless of how many chunks
-// (see [defaultReportChunkSize]) the batch is split across
-// internally. Aliases themselves never fail the write: per
-// [domain.InventoryReplacement.Aliases]'s doc, reported aliases are
-// stored as a pending payload with no synchronous cross-resource
-// conflict detection, so two reports (even in the same batch) may
-// freely assert the same alias for different resources.
+// directly. Entries with [InventoryReplacementInput.IsDelete] true are
+// exact-name hard deletes: they never resolve aliases, never allocate
+// CandidateUID, reject non-empty payload fields, and are allowed only
+// for inventory-only types. Upserts and deletes in the same call are
+// one mixed [domain.ExtensionResourceRepository.ReplaceInventory]
+// batch (chunked only for statement size) inside one transaction.
+//
+// The batch is all-or-nothing: a duplicate resolved
+// [domain.ResourceName] within the batch (including contradictory
+// delete+replacement for the same key, even across chunk boundaries),
+// a type without inventory metadata, a delete against a
+// managed-plus-inventory type, or an unresolvable/ambiguous alias-only
+// report fails the whole call before any inventory write commits,
+// regardless of how many chunks (see [defaultReportChunkSize]) the
+// batch is split across internally. Aliases on non-delete reports
+// never fail the write: per [domain.InventoryReplacement.Aliases]'s
+// doc, reported aliases are stored as a pending payload with no
+// synchronous cross-resource conflict detection, so two reports (even
+// in the same batch) may freely assert the same alias for different
+// resources.
 func (s *InventoryReportService) ReplaceBatch(ctx context.Context, in InventoryReplacementBatchInput) error {
 	if len(in.Reports) == 0 {
 		return nil
+	}
+
+	for i, report := range in.Reports {
+		if report.IsDelete {
+			if err := validateDeleteReplacementInput(i, report); err != nil {
+				return err
+			}
+		}
 	}
 
 	tx, err := s.store.Begin(ctx)
@@ -198,6 +225,7 @@ func (s *InventoryReportService) ReplaceBatch(ctx context.Context, in InventoryR
 				ResourceType: report.ResourceType,
 				Name:         report.Name,
 				Aliases:      report.Aliases,
+				IsDelete:     report.IsDelete,
 			}
 		}
 		targets, err := res.resolveBatch(ctx, identities, start)
@@ -207,6 +235,14 @@ func (s *InventoryReportService) ReplaceBatch(ctx context.Context, in InventoryR
 
 		replacements := make([]domain.InventoryReplacement, len(chunk))
 		for i, report := range chunk {
+			if report.IsDelete {
+				replacements[i] = domain.InventoryReplacement{
+					ResourceType: report.ResourceType,
+					Name:         targets[i],
+					IsDelete:     true,
+				}
+				continue
+			}
 			replacements[i] = domain.InventoryReplacement{
 				ResourceType: report.ResourceType,
 				Name:         targets[i],
@@ -311,13 +347,10 @@ func (s *InventoryReportService) ApplyDeltaBatch(ctx context.Context, in Invento
 	return tx.Commit()
 }
 
-// validateDeltaReport catches internally conflicting delta fields
-// before any identity resolution or persistence is attempted, per the
-// rework doc's delta semantics. It delegates to
-// [domain.ValidateInventoryDelta] -- the same check the repository
-// layer now also runs -- rather than duplicating it, so failing fast
-// here before a single round trip and defending the repository's own
-// contract stay backed by exactly one implementation.
+// validateDeltaReport rejects internally conflicting delta fields
+// before identity resolution or persistence. It delegates to
+// [domain.ValidateInventoryDelta], which [ApplyInventoryDeltas] also
+// runs.
 func validateDeltaReport(report InventoryDeltaInput) error {
 	return domain.ValidateInventoryDelta(domain.InventoryDelta{
 		UpsertAliases:     report.UpsertAliases,
@@ -330,6 +363,28 @@ func validateDeltaReport(report InventoryDeltaInput) error {
 		UpsertConditions:  report.UpsertConditions,
 		DeleteConditions:  report.DeleteConditions,
 	})
+}
+
+// validateDeleteReplacementInput rejects unsafe whole-resource delete
+// shapes before identity resolution or persistence. Name must be
+// non-nil on the application DTO (a nil pointer has no domain
+// equivalent). Remaining delete rules are enforced by
+// [domain.ValidateInventoryReplacements], which [ReplaceInventory] also
+// runs.
+func validateDeleteReplacementInput(i int, report InventoryReplacementInput) error {
+	if report.Name == nil {
+		return fmt.Errorf("%w: report %d: IsDelete requires Name", domain.ErrInvalidArgument, i)
+	}
+	return domain.ValidateInventoryReplacements([]domain.InventoryReplacement{{
+		ResourceType: report.ResourceType,
+		Name:         *report.Name,
+		IsDelete:     true,
+		Aliases:      report.Aliases,
+		Labels:       report.Labels,
+		Observation:  report.Observation,
+		Conditions:   report.Conditions,
+		ObservedAt:   report.ObservedAt,
+	}})
 }
 
 // forEachReportChunk calls fn once per contiguous chunk of at most
@@ -359,6 +414,7 @@ type reportIdentity struct {
 	ResourceType domain.ResourceType
 	Name         *domain.ResourceName
 	Aliases      domain.AliasSet
+	IsDelete     bool
 }
 
 // reportResolver implements the shared identity/type resolution path
@@ -411,18 +467,27 @@ func newReportResolver(tx domain.Tx) *reportResolver {
 // position within the overall call (0 unless the caller is
 // chunking), used only to produce accurate cross-chunk
 // duplicate-report error messages. It's all-or-nothing: any
-// resolution failure (a type without inventory metadata, a missing
-// Name/Aliases, an unresolvable or contradictory alias, or a
-// duplicate resolved target anywhere in the call, even in an earlier
-// chunk) returns an error before any inventory write for items is
-// attempted. None of this is persisted until the caller commits the
-// transaction.
+// resolution failure (a type without inventory metadata, a delete
+// against a managed-plus-inventory type, a missing Name/Aliases, an
+// unresolvable or contradictory alias, or a duplicate resolved target
+// anywhere in the call, even in an earlier chunk) returns an error
+// before any inventory write for items is attempted. None of this is
+// persisted until the caller commits the transaction.
 func (r *reportResolver) resolveBatch(ctx context.Context, items []reportIdentity, baseIndex int) ([]domain.ResourceName, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
 
 	for _, in := range items {
+		if in.IsDelete {
+			if _, err := r.lookupInventoryOnlyType(ctx, in.ResourceType); err != nil {
+				return nil, err
+			}
+			if in.Name == nil {
+				return nil, fmt.Errorf("%w: IsDelete report must set Name", domain.ErrInvalidArgument)
+			}
+			continue
+		}
 		if _, err := r.lookupInventoryType(ctx, in.ResourceType); err != nil {
 			return nil, err
 		}
@@ -433,7 +498,7 @@ func (r *reportResolver) resolveBatch(ctx context.Context, items []reportIdentit
 
 	var aliasQuery []domain.Alias
 	for _, in := range items {
-		if in.Name == nil {
+		if !in.IsDelete && in.Name == nil {
 			aliasQuery = append(aliasQuery, in.Aliases.Slice()...)
 		}
 	}
@@ -482,6 +547,23 @@ func (r *reportResolver) lookupInventoryType(ctx context.Context, rt domain.Reso
 	return typeDef, nil
 }
 
+// lookupInventoryOnlyType is [lookupInventoryType] plus the
+// whole-resource-delete policy: the type must not also have management
+// metadata. Managed-plus-inventory hard delete is intentionally not
+// available through ordinary inventory reporting.
+func (r *reportResolver) lookupInventoryOnlyType(ctx context.Context, rt domain.ResourceType) (domain.ExtensionResourceType, error) {
+	typeDef, err := r.lookupInventoryType(ctx, rt)
+	if err != nil {
+		return domain.ExtensionResourceType{}, err
+	}
+	if typeDef.Management() != nil {
+		return domain.ExtensionResourceType{}, fmt.Errorf(
+			"%w: type %q has management metadata; whole-resource delete is allowed only for inventory-only types",
+			domain.ErrInvalidArgument, rt)
+	}
+	return typeDef, nil
+}
+
 // resolveByAliases picks the single platform resource that every
 // alias in aliases agrees on, using resolved (the whole batch's
 // [domain.ResourceIdentityRepository.ResolveAliasesBatch] result) to
@@ -511,7 +593,8 @@ func resolveByAliases(aliases domain.AliasSet, resolved map[domain.Alias]domain.
 // same extension resource before any inventory-write SQL runs --
 // whether because two reports named the same resource directly, or
 // because a by-Name and a by-Alias report both resolved to the same
-// underlying resource. This is a superset of the old by-Name-only
+// underlying resource, or because a delete and a replacement target
+// the same natural key. This is a superset of the old by-Name-only
 // check: it runs after every report's target is known, so it catches
 // both shapes with one pass. Tracking r.seenNames on the resolver
 // itself, rather than locally to this call, catches a duplicate split

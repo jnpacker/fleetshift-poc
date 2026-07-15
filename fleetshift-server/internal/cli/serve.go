@@ -205,6 +205,29 @@ func runServe(ctx context.Context, f *serveFlags) error {
 	inventoryReportService := application.NewInventoryReportService(store)
 	inventoryReporter := application.NewInventoryReporterAdapter(inventoryReportService)
 
+	// --- kubernetes indexing runtime ---
+	//
+	// Built before Kind/GCP agents so those agents can receive an
+	// IndexingRuntime and call EnsureIndexer / StopIndexer. With that
+	// runtime injected, indexers start from those agents before Delivered
+	// and from a one-shot startup replay after addon connect.
+	// Orchestration does not start or stop indexers.
+	var kubeIndexing *kubernetesInProcessIndexing
+	var kubeIndexCtx context.Context
+	var kubeIndexCancel context.CancelFunc
+	if enabledAddons["kubernetes"] {
+		kubeIndexCtx, kubeIndexCancel = context.WithCancel(ctx)
+		defer kubeIndexCancel()
+		kubeIndexing = newKubernetesInProcessIndexing(kubeIndexCtx, store, vault, logger)
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := kubeIndexing.Runtime.StopAll(stopCtx); err != nil {
+				logger.Error("kubernetes index StopAll error", "error", err)
+			}
+		}()
+	}
+
 	// --- construct addon agents ---
 	//
 	// Agent construction stays here because agents have external
@@ -220,6 +243,9 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		}
 		if oidcCABundle != nil {
 			kindOpts = append(kindOpts, kindaddon.WithOIDCCABundle(oidcCABundle))
+		}
+		if kubeIndexing != nil {
+			kindOpts = append(kindOpts, kindaddon.WithIndexingRuntime(kubeIndexing.Runtime))
 		}
 		kindAgent = kindaddon.NewAgent(
 			deliveryReporter,
@@ -248,11 +274,15 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			if err != nil {
 				return fmt.Errorf("parse gcphcp config: %w", err)
 			}
-			gcphcpConcreteAgent = gcphcpaddon.NewAgent(gcphcpaddon.AgentDeps{
+			deps := gcphcpaddon.AgentDeps{
 				Gateway:  gcphcpCfg.Gateway,
 				Observer: gcphcpaddon.NewSlogAgentObserver(logger),
 				Reporter: deliveryReporter,
-			})
+			}
+			if kubeIndexing != nil {
+				deps.IndexingRuntime = kubeIndexing.Runtime
+			}
+			gcphcpConcreteAgent = gcphcpaddon.NewAgent(deps)
 			gcphcpAgent = gcphcpConcreteAgent
 		} else {
 			logger.Warn("gcphcp addon enabled but no config provided, skipping")
@@ -461,14 +491,14 @@ func runServe(ctx context.Context, f *serveFlags) error {
 
 	var kubeAgent domain.DeliveryAgent
 	if enabledAddons["kubernetes"] {
-		kubeAgentOpts := []kubernetesaddon.AgentOption{
+		kubeAgentOpts := []kubernetesaddon.DeliveryAgentOption{
 			kubernetesaddon.WithKeyResolver(keyResolver),
 			kubernetesaddon.WithVault(vault),
 		}
 		if oidcHTTPClient != nil {
 			kubeAgentOpts = append(kubeAgentOpts, kubernetesaddon.WithHTTPClient(oidcHTTPClient))
 		}
-		kubeAgent = kubernetesaddon.NewAgent(deliveryReporter, kubeAgentOpts...)
+		kubeAgent = kubernetesaddon.NewDeliveryAgent(deliveryReporter, kubeAgentOpts...)
 	}
 
 	// --- dynamic service infrastructure ---
@@ -672,7 +702,8 @@ func runServe(ctx context.Context, f *serveFlags) error {
 
 	if enabledAddons["kubernetes"] {
 		if err := addonMgr.Connect(ctx, kubernetesaddon.Descriptor().ID, application.ConnectInput{
-			Agent: kubeAgent,
+			Agent:   kubeAgent,
+			Schemas: []domain.ExtensionResourceSchema{kubernetesaddon.InventorySchema()},
 		}); err != nil {
 			return fmt.Errorf("connect kubernetes addon: %w", err)
 		}
@@ -701,6 +732,23 @@ func runServe(ctx context.Context, f *serveFlags) error {
 				logger.Error("gcphcp: failed to recover active deliveries", "error", err)
 			}
 		}
+	}
+
+	// All addons are now connected and recovery has been attempted. One-shot
+	// startup replay recovers persisted Kubernetes targets; it must not block
+	// listen. Join the replay goroutine before StopAll on shutdown.
+	if kubeIndexing != nil {
+		replayDone := startKubernetesIndexStartupReplay(kubeIndexCtx, func(replayCtx context.Context) {
+			kubernetesaddon.ReplayPersistedIndexers(
+				replayCtx,
+				storeTargetLister{store: store},
+				vault,
+				kubeIndexing.Runtime,
+				logger,
+			)
+		})
+		defer func() { <-replayDone }()
+		logger.Info("kubernetes index startup replay started")
 	}
 
 	// --- shutdown ---

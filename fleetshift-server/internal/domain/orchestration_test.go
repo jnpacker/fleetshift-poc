@@ -1451,6 +1451,90 @@ func TestOrchestration_DeletePipeline_CleansUpOwnedOutputsAndSecrets(t *testing.
 	}
 }
 
+// TestOrchestration_DeletePipeline_MissingTargetRowForOwnedInventoryItem_SkipsNotFails
+// pins that a delivery-owned inventory item whose "target:{id}" points at a
+// target row that is already gone must be skipped, not treated as an error.
+// The delivery-owned inventory item itself is still deleted normally, since
+// that deletion does not depend on the target row's existence.
+func TestOrchestration_DeletePipeline_MissingTargetRowForOwnedInventoryItem_SkipsNotFails(t *testing.T) {
+	store, vault := setupStore(t)
+	seedFulfillmentAndDeployment(t, store, "deployments/d1", domain.FulfillmentSnapshot{
+		Generation:      2,
+		ResolvedTargets: []domain.TargetID{"gcphcp-provider"},
+		ManifestStrategy: domain.ManifestStrategySpec{
+			Type: domain.ManifestStrategyInline,
+			Manifests: []domain.Manifest{{
+				ManifestType: "api.gcphcp.cluster",
+				Raw:          json.RawMessage(`{"name":"guest-cluster"}`),
+			}},
+		},
+		PlacementStrategy: domain.PlacementStrategySpec{
+			Type:    domain.PlacementStrategyStatic,
+			Targets: []domain.TargetID{"gcphcp-provider"},
+		},
+		State: domain.FulfillmentStateDeleting,
+	})
+	seedTargets(t, store, domain.TargetInfoFromSnapshot(domain.TargetInfoSnapshot{ID: "gcphcp-provider", Name: "gcphcp-provider", Type: "gcphcp"}))
+
+	deliveryID := domain.DeliveryID("deployments/d1:gcphcp-provider")
+	seedDelivery(t, store, domain.DeliveryFromSnapshot(domain.DeliverySnapshot{
+		ID:            deliveryID,
+		FulfillmentID: domain.FulfillmentID("deployments/d1"),
+		TargetID:      "gcphcp-provider",
+		Manifests: []domain.Manifest{{
+			ManifestType: "api.gcphcp.cluster",
+			Raw:          json.RawMessage(`{"name":"guest-cluster"}`),
+		}},
+		State: domain.DeliveryStateDelivered,
+	}))
+
+	ctx := testContext(t)
+	tx, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	defer tx.Rollback()
+	// Deliberately no corresponding tx.Targets().Create call: this
+	// inventory item's target row is already gone through some other path.
+	if err := tx.Inventory().Create(ctx, domain.InventoryItemFromSnapshot(domain.InventoryItemSnapshot{
+		ID:               "target:ghost-target",
+		Type:             "gcphcp",
+		Name:             "ghost",
+		SourceDeliveryID: &deliveryID,
+	})); err != nil {
+		t.Fatalf("seed inventory item: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit seeded output: %v", err)
+	}
+
+	events := make(chan domain.FulfillmentEvent, 16)
+	wf := newTestWorkflow(store, noopDelivery{events: events}, events, func(wf *domain.OrchestrationWorkflowSpec) {
+		wf.Vault = vault
+	})
+
+	rec := &simpleRecord{ctx: ctx, events: events}
+	if _, err := wf.Run(rec, domain.FulfillmentID("deployments/d1")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	readTx, err := store.BeginReadOnly(ctx)
+	if err != nil {
+		t.Fatalf("begin read tx: %v", err)
+	}
+	defer readTx.Rollback()
+	if _, err := readTx.Inventory().Get(ctx, "target:ghost-target"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("expected ghost inventory item to be deleted, got err=%v", err)
+	}
+	f, err := readTx.Fulfillments().Get(ctx, domain.FulfillmentID("deployments/d1"))
+	if err != nil {
+		t.Fatalf("expected fulfillment to still exist, got: %v", err)
+	}
+	if f.State() != domain.FulfillmentStateDeleting {
+		t.Errorf("fulfillment state = %q, want deleting", f.State())
+	}
+}
+
 func TestOrchestration_DeletePipeline_MissingDeliveryRecord_Skips(t *testing.T) {
 	store, _ := setupStore(t)
 	seedFulfillmentAndDeployment(t, store, "deployments/d1", domain.FulfillmentSnapshot{

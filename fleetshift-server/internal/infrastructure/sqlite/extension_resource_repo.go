@@ -1092,26 +1092,40 @@ func (r *ExtensionResourceRepo) deleteOrphanedClaims(ctx context.Context, claimI
 }
 
 // ReplaceInventory implements [domain.ExtensionResourceRepository.ReplaceInventory]
-// as a fixed number of round trips for the whole batch: it resolves-
-// or-creates every replacement's extension_resources row by natural
-// key (resolveOrCreateExtensionResources, seeding a brand-new row's
-// reported_aliases directly from that same replacement), writes every
+// as a fixed number of round trips for the whole batch. IsDelete entries
+// are validated and hard-deleted first (never resolve-or-create);
+// replacements then resolve-or-create every remaining row by natural key
+// (resolveOrCreateExtensionResources, seeding a brand-new row's
+// reported_aliases directly from that same replacement), write every
 // resource's complete latest labels/conditions/observation in one
-// upsert, then writes only the pending alias payload for resources
+// upsert, then write only the pending alias payload for resources
 // whose canonical payload has actually changed since the last
 // successful write.
 func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacements []domain.InventoryReplacement) error {
 	if len(replacements) == 0 {
 		return nil
 	}
+	if err := domain.ValidateInventoryReplacements(replacements); err != nil {
+		return err
+	}
 
-	n := len(replacements)
+	deletes, upserts := partitionInventoryReplacements(replacements)
+	if len(deletes) > 0 {
+		if err := r.deleteInventoryReplacements(ctx, deletes); err != nil {
+			return fmt.Errorf("replace inventory: %w", err)
+		}
+	}
+	if len(upserts) == 0 {
+		return nil
+	}
+
+	n := len(upserts)
 	resourceTypes := make([]domain.ResourceType, n)
 	names := make([]domain.ResourceName, n)
 	candidateUIDs := make([]domain.ExtensionResourceUID, n)
 	receivedAts := make([]time.Time, n)
 	reportedAliasPayloads := make([]string, n)
-	for i, rep := range replacements {
+	for i, rep := range upserts {
 		resourceTypes[i] = rep.ResourceType
 		names[i] = rep.Name
 		candidateUIDs[i] = rep.CandidateUID
@@ -1129,7 +1143,7 @@ func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacemen
 	}
 
 	invItems := make([]inventoryRowInput, n)
-	for i, rep := range replacements {
+	for i, rep := range upserts {
 		labelsJSON, err := json.Marshal(nonNilLabels(rep.Labels))
 		if err != nil {
 			return fmt.Errorf("marshal labels: %w", err)
@@ -1158,7 +1172,7 @@ func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacemen
 	// resolveOrCreateExtensionResources's own INSERT (see that
 	// method's doc comment), so it naturally compares equal here and
 	// is skipped -- no separate exclusion needed.
-	for i := range replacements {
+	for i := range upserts {
 		if reportedAliasPayloads[i] == storedAliasPayloads[i] {
 			continue
 		}
@@ -1170,6 +1184,20 @@ func (r *ExtensionResourceRepo) ReplaceInventory(ctx context.Context, replacemen
 		}
 	}
 	return nil
+}
+
+// partitionInventoryReplacements splits a validated mixed batch into
+// IsDelete entries and upserts, preserving relative order within each
+// partition.
+func partitionInventoryReplacements(replacements []domain.InventoryReplacement) (deletes, upserts []domain.InventoryReplacement) {
+	for _, rep := range replacements {
+		if rep.IsDelete {
+			deletes = append(deletes, rep)
+			continue
+		}
+		upserts = append(upserts, rep)
+	}
+	return deletes, upserts
 }
 
 // ApplyInventoryDeltas implements [domain.ExtensionResourceRepository.ApplyInventoryDeltas]
@@ -1403,6 +1431,75 @@ func (r *ExtensionResourceRepo) batchReadCurrentReportedAliases(ctx context.Cont
 		result[uid] = domain.AliasSetFromSnapshot(aliases)
 	}
 	return result, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Inventory hard-delete (IsDelete replacements)
+// ---------------------------------------------------------------------------
+
+// hardDeleteExtensionResourcesByPredicate deletes extension_resources rows
+// matching whereSQL/args, running the same orphaned-alias-claim cleanup
+// [ExtensionResourceRepo.Delete] does, but treating zero matching rows
+// as success rather than [domain.ErrNotFound]. This is the shared hard-
+// delete shape [ExtensionResourceRepo.deleteInventoryReplacements]
+// needs for source-driven IsDelete replacements, where a duplicate or
+// already-absent delete must not fail. whereSQL must reference
+// extension_resources columns unqualified, since it is reused verbatim
+// against both the unaliased DELETE and the alias-claim lookup JOIN
+// below.
+func (r *ExtensionResourceRepo) hardDeleteExtensionResourcesByPredicate(ctx context.Context, whereSQL string, args []any) error {
+	rows, err := r.DB.QueryContext(ctx,
+		`SELECT c.claim_id FROM resource_alias_contributions c
+		 JOIN extension_resources ON extension_resources.uid = c.source_extension_resource_uid
+		 WHERE `+whereSQL, args...)
+	if err != nil {
+		return fmt.Errorf("find alias claims for delete: %w", err)
+	}
+	var claimIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan alias claim id for delete: %w", err)
+		}
+		claimIDs = append(claimIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("find alias claims for delete: %w", err)
+	}
+	rows.Close()
+
+	if _, err := r.DB.ExecContext(ctx, `DELETE FROM extension_resources WHERE `+whereSQL, args...); err != nil {
+		return err
+	}
+
+	if err := r.deleteOrphanedClaims(ctx, claimIDs); err != nil {
+		return fmt.Errorf("clean up orphaned alias claims: %w", err)
+	}
+	return nil
+}
+
+// deleteInventoryReplacements hard-deletes every IsDelete replacement
+// by full resource type (service_name + type_name) and name. Missing
+// rows are success; CandidateUID is never consulted.
+func (r *ExtensionResourceRepo) deleteInventoryReplacements(ctx context.Context, deletes []domain.InventoryReplacement) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(deletes))
+	args := make([]any, 0, len(deletes)*4)
+	for i, rep := range deletes {
+		placeholders[i] = "(?, ?, ?, ?)"
+		args = append(args,
+			string(rep.ResourceType.ServiceName()),
+			rep.ResourceType.TypeName(),
+			string(rep.Name.Collection()),
+			string(rep.Name.ID()),
+		)
+	}
+	whereSQL := fmt.Sprintf("(service_name, type_name, collection_name, resource_id) IN (%s)", strings.Join(placeholders, ", "))
+	return r.hardDeleteExtensionResourcesByPredicate(ctx, whereSQL, args)
 }
 
 func (r *ExtensionResourceRepo) ListObservations(ctx context.Context, uid domain.ExtensionResourceUID, limit int) ([]domain.Observation, error) {

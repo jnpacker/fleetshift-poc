@@ -49,19 +49,27 @@ tasks:
 
   test:all:
     desc: Run unit tests for all modules
-    deps: [test:server, test:cli]
+    deps: [test:server, test:cli, test:server-integration]
 
   test:server:
     desc: Run server tests
     dir: fleetshift-server
     cmds:
-      - go test -tags=integration -count=1 ./...
+      - go test -count=1 ./...
 
   test:cli:
     desc: Run CLI tests
     dir: fleetshift-cli
     cmds:
       - go test -count=1 ./...
+
+  test:server-integration:
+    desc: Docker integration tests
+    dir: fleetshift-server
+    cmds:
+      - go test -tags integration -count=1 -timeout 15m ./internal/addon/kind/
+      - go test -tags integration -count=1 -timeout 15m ./internal/addon/kubernetes/
+      - go test -race -count=1 ./internal/addon/kubernetes/
 
   protogen:
     desc: Generate protobuf and gRPC code (skips if unchanged)
