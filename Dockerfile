@@ -1,3 +1,8 @@
+# Prebuilt multiarch hypershift CLI (openshift/hypershift v0.1.79).
+# Quay tags this image by git SHA, not semver: 65839bbab… == v0.1.79.
+# Override with --build-arg HYPERSHIFT_IMAGE=... when needed.
+ARG HYPERSHIFT_IMAGE=quay.io/acm-d/rhtap-hypershift-operator:65839bbab12247d630a498e487af6f30d7788620
+
 FROM golang:1.25 AS fleetshift-builder
 
 WORKDIR /src
@@ -6,7 +11,8 @@ WORKDIR /src
 # CLI has a replace directive pointing to ../fleetshift-server
 COPY fleetshift-server/go.mod fleetshift-server/go.sum ./fleetshift-server/
 COPY fleetshift-cli/go.mod fleetshift-cli/go.sum ./fleetshift-cli/
-RUN cd fleetshift-server && go mod download && \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    cd fleetshift-server && go mod download && \
     cd ../fleetshift-cli && go mod download
 
 # Copy all source (server, cli)
@@ -14,31 +20,24 @@ COPY fleetshift-server/ ./fleetshift-server/
 COPY fleetshift-cli/ ./fleetshift-cli/
 
 # Build both binaries
-RUN cd fleetshift-server && CGO_ENABLED=0 go build -o /bin/fleetshift ./cmd/fleetshift
-RUN cd fleetshift-cli && CGO_ENABLED=0 go build -o /bin/fleetctl ./cmd/fleetctl
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd fleetshift-server && CGO_ENABLED=0 go build -o /bin/fleetshift ./cmd/fleetshift
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd fleetshift-cli && CGO_ENABLED=0 go build -o /bin/fleetctl ./cmd/fleetctl
 
-FROM golang:1.25 AS hypershift-builder
-
-WORKDIR /src
-
-ARG HYPERSHIFT_REF=v0.1.76
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN git clone --branch "${HYPERSHIFT_REF}" --depth 1 https://github.com/openshift/hypershift.git /src/hypershift
-RUN cd /src/hypershift && CGO_ENABLED=0 go build -p 2 -o /bin/hypershift .
+FROM ${HYPERSHIFT_IMAGE} AS hypershift
 
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=fleetshift-builder /bin/fleetshift /usr/local/bin/fleetshift
 COPY --from=fleetshift-builder /bin/fleetctl /usr/local/bin/fleetctl
-COPY --from=hypershift-builder /bin/hypershift /usr/local/bin/hypershift
+COPY --from=hypershift /usr/bin/hypershift /usr/local/bin/hypershift
 
 EXPOSE 50051 8085
 

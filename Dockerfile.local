@@ -5,7 +5,7 @@ ARG KUBECTL_VERSION=v1.33.0
 
 RUN set -eux; \
     apt-get update; \
-    apt-get install -y --no-install-recommends podman; \
+    apt-get install -y --no-install-recommends curl podman; \
     rm -rf /var/lib/apt/lists/*; \
     ARCH="$(dpkg --print-architecture)"; \
     curl -Lo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${ARCH}"; \

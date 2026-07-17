@@ -1,0 +1,39 @@
+# VCS / tooling / local env
+.git
+.github
+.vscode
+.cursor
+.claude
+.claude_state
+.coderabbit.yaml
+.superpowers
+.task
+.worktrees
+.venv
+.env
+.env.*
+
+# Repo areas not needed for server/cli image builds
+# (Dockerfile only COPYs fleetshift-server/ and fleetshift-cli/)
+bin
+**/bin/
+poc
+docs
+deploy
+proto
+data
+*.md
+Taskfile.yml
+
+# Build / test artifacts (keep compile layers stable when only tests change)
+**/*_test.go
+*.test
+*.out
+coverage.*
+*.db
+*.db-shm
+*.db-wal
+
+# Server docs / test helpers not linked into the binary
+fleetshift-server/docs
+fleetshift-server/testserver
