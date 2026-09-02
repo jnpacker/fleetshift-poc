@@ -73,6 +73,7 @@ All CSS classes are scoped with a prefix to prevent collisions across MF boundar
 | Signing plugin | `ome-signing-` | `ome-signing-keys`, `ome-signing-keys__form` |
 | Management plugin | `ome-mgmt-` | `ome-mgmt-targets`, `ome-mgmt-targets__row` |
 | Kind plugin | `ome-kind-` | `ome-kind-wizard`, `ome-kind-wizard__step` |
+| Assisted plugin | `ome-assisted-` | `ome-assisted-wizard`, `ome-assisted-wizard__step` |
 | Settings plugin | `ome-settings-` | `ome-settings-nav-order`, `ome-settings-nav-order__item` |
 
 Enforced by stylelint (`stylelint.config.mjs`) with per-plugin overrides. Run `npm run lint:css` to check.

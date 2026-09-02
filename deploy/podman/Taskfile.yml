@@ -22,7 +22,7 @@ vars:
       esac
   RESOLVED_GCPHCP_CONFIG: '{{.ROOT_DIR}}/deploy/podman/.gcphcp.yaml'
   RESOLVED_OIDC_URL: '{{if eq .RESOLVED_AUTH "external"}}{{.OIDC_ISSUER_URL}}{{else}}https://{{.KC_HOSTNAME | default "keycloak"}}:{{.KC_HTTPS_PORT | default "8443"}}/auth/realms/fleetshift{{end}}'
-  RESOLVED_SERVER_ADDONS: '{{if eq .RESOLVED_GCPHCP_ENABLED "true"}}kind,kubernetes,gcphcp{{else}}kind,kubernetes{{end}}'
+  RESOLVED_SERVER_ADDONS: '{{if eq .RESOLVED_GCPHCP_ENABLED "true"}}kind,kubernetes,gcphcp,assisted{{else}}kind,kubernetes,assisted{{end}}'
   RESOLVED_DB_FLAG:
     sh: |
       if [ "{{.RESOLVED_DB}}" = "postgres" ]; then

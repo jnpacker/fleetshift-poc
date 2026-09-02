@@ -136,11 +136,26 @@ func setCacheHeaders(w http.ResponseWriter, path string) {
 	base := filepath.Base(path)
 
 	switch {
-	case base == "index.html":
+	// HTML entry points have stable, non-content-hashed filenames (e.g.
+	// index.html, silent-renew.html — the latter is an OIDC redirect_uri
+	// target and can never be hashed), so they must always revalidate.
+	case strings.HasSuffix(base, ".html"):
 		w.Header().Set("Cache-Control", "no-cache")
 	case strings.HasSuffix(base, "-manifest.json"):
 		w.Header().Set("Cache-Control", "no-cache")
 	case base == "plugin-registry.json":
+		w.Header().Set("Cache-Control", "no-cache")
+	// Module Federation "exposed module" chunks (exposed-<Name>.js) are
+	// named by @openshift/dynamic-plugin-sdk-webpack using a stable,
+	// non-content-hashed convention so the plugin loader can reference
+	// them by predictable path -- unlike the content-hashed remoteEntry
+	// and vendor/shared chunk filenames, their content can change across
+	// builds while the URL stays the same. Caching these immutably means
+	// browsers never see rebuilt plugin code (a real-world symptom: a
+	// plugin's wizard keeps showing stale/simulated behavior long after
+	// the server has been rebuilt with the fix). They must always
+	// revalidate, same as the manifest/registry files that reference them.
+	case strings.HasPrefix(base, "exposed-"):
 		w.Header().Set("Cache-Control", "no-cache")
 	default:
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")

@@ -32,6 +32,9 @@ export interface ClusterResource {
     nodepools?: NodepoolSpec[];
     endpointAccess?: string;
     channelGroup?: string;
+    /** Assisted-installer cluster topology ("SNO", "Compact", or
+     * "Full") -- see assisted-plugin/api.ts's ClusterTopology. */
+    topology?: string;
   };
 }
 
@@ -104,6 +107,7 @@ const SERVICE_LABELS: Record<string, string> = {
   "gcphcp.fleetshift.io": "GCP HCP",
   "kind.fleetshift.io": "Kind",
   "kubernetes.fleetshift.io": "Kubernetes",
+  "assisted.fleetshift.io": "Assisted Installer",
 };
 
 export function serviceLabel(service: string): string {

@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package addons.assisted.v1;
+
+option go_package = "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/assisted";
+
+// AssistedClusterSpec defines the desired state of a bare-metal
+// OpenShift cluster provisioned via the Red Hat Assisted Installer
+// Service. Provisioning itself happens out-of-band: the create-cluster
+// wizard talks to the real Assisted Service directly through the OCM
+// proxy (see fleetshift-server/internal/transport/http/assisted_ocm.go
+// and assisted_ocm_clusters.go) to create the cluster, InfraEnv, and
+// Discovery ISO. This spec just records what the wizard submitted so
+// the cluster is visible in FleetShift's own inventory from creation
+// time, and so a Hosts tab can resume polling the Assisted Service
+// using the recorded cluster/InfraEnv IDs.
+message AssistedClusterSpec {
+  // OpenShift version requested for the cluster (e.g. "4.19.10").
+  string release_version = 1;
+
+  // Base DNS domain (e.g. "example.com").
+  string base_domain = 2;
+
+  // CPU architecture requested (e.g. "x86_64").
+  string cpu_architecture = 3;
+
+  // Assisted Service cluster ID, from POST /v2/clusters.
+  string assisted_cluster_id = 4;
+
+  // Assisted Service InfraEnv ID, from POST /v2/infra-envs.
+  string infra_env_id = 5;
+
+  // FIPS mode requested.
+  bool fips = 6;
+
+  // Fully disconnected (air-gapped) installation requested. Not yet
+  // wired to the Assisted Service create-cluster call -- recorded for
+  // future use.
+  bool disconnected = 7;
+
+  // Cluster topology requested at creation time: "SNO" (single-node
+  // OpenShift, 1 host acting as both control plane and worker),
+  // "Compact" (3 hosts, each acting as both control plane and
+  // worker), or "Full" (3+ dedicated control-plane hosts plus
+  // separate worker hosts). Maps to the Assisted Service's
+  // control_plane_count field when the cluster is created (see
+  // fleetshift-server/internal/transport/http/assisted_ocm_clusters.go);
+  // recorded here so the Hosts and Overview tabs can display it and
+  // compute the minimum host count without re-querying the Assisted
+  // Service.
+  string topology = 8;
+}

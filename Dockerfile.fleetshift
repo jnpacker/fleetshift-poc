@@ -27,7 +27,8 @@
 #
 # The entrypoint optionally renders GCP HCP config when the caller expresses
 # intent (GCPHCP_GATEWAY_URL, GCPHCP_CONFIG, or GCPHCP_ENABLED=true). The
-# default addon list remains kind,kubernetes until that intent is present.
+# default addon list remains kind,kubernetes,assisted until that intent is
+# present.
 ARG SERVER_IMAGE=quay.io/stolostron/fleetshift-server-local:latest
 ARG WEB_IMAGE=quay.io/stolostron/fleetshift-web:latest
 FROM ${WEB_IMAGE} AS web-assets

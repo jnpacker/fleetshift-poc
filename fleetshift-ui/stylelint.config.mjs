@@ -66,6 +66,12 @@ export default {
       },
     },
     {
+      files: ["packages/mock-ui-plugins/src/plugins/assisted-plugin/**/*.{scss,css}"],
+      rules: {
+        "selector-class-pattern": pluginPattern("ome-assisted-", "ome-assisted-wizard, ome-assisted-wizard__step"),
+      },
+    },
+    {
       files: ["packages/mock-ui-plugins/src/plugins/settings-plugin/**/*.{scss,css}"],
       rules: {
         "selector-class-pattern": pluginPattern("ome-settings-", "ome-settings-nav-order, ome-settings-nav-order__item"),

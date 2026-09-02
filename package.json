@@ -5,6 +5,17 @@
     "fleetshift-ui",
     "fleetshift-ui/packages/*"
   ],
+  "overrides": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@rspack/core": "2.0.8",
+    "uuid": "^11.1.1",
+    "undici": "^7.28.0",
+    "form-data": "^4.0.6",
+    "dompurify": "^3.4.11"
+  },
   "nx": {
     "targets": {
       "build:all": {

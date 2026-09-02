@@ -30,7 +30,13 @@ const config: Configuration = {
   output: {
     publicPath: "/",
     path: path.resolve(configDir, "dist"),
-    chunkFilename: "shell/[name].js",
+    // Content-hashed filenames so the Go server's long-lived "immutable"
+    // cache header (see static.go's setCacheHeaders) is actually safe —
+    // without a hash, browsers cache these for a year and never see
+    // rebuilds. Matches the content-hashing already used for every
+    // plugin's entryScriptFilename in mock-ui-plugins/rspack.config.ts.
+    filename: "[name].[contenthash].js",
+    chunkFilename: "shell/[name].[contenthash].js",
     clean: true,
   },
   mode: "development",

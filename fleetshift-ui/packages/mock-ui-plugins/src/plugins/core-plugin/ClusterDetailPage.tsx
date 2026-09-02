@@ -59,7 +59,7 @@ import {
 const clusterApi = createResourceApi<ClusterResource>("-");
 
 const CLUSTER_TYPE_FILTER =
-  'resourceType == "gcphcp.fleetshift.io/Cluster" || resourceType == "kind.fleetshift.io/Cluster"';
+  'resourceType == "gcphcp.fleetshift.io/Cluster" || resourceType == "kind.fleetshift.io/Cluster" || resourceType == "assisted.fleetshift.io/Cluster"';
 
 interface ResolvedTab {
   id: string;
@@ -89,6 +89,7 @@ function OverviewTab({
   const { spec } = cluster;
   const isGcpHcp = service === "gcphcp.fleetshift.io";
   const isKind = service === "kind.fleetshift.io";
+  const isAssisted = service === "assisted.fleetshift.io";
 
   return (
     <div className="ome-core-overview-layout">
@@ -117,7 +118,9 @@ function OverviewTab({
                   ? (spec?.nodepools?.length ?? 0)
                   : isKind
                     ? "Kind"
-                    : "—"}
+                    : isAssisted
+                      ? "Assisted Installer"
+                      : "—"}
               </Title>
             </CardBody>
           </Card>
@@ -222,6 +225,14 @@ function OverviewTab({
                     <DescriptionListTerm>Endpoint Access</DescriptionListTerm>
                     <DescriptionListDescription>
                       {spec.endpointAccess}
+                    </DescriptionListDescription>
+                  </DescriptionListGroup>
+                )}
+                {isAssisted && spec?.topology && (
+                  <DescriptionListGroup>
+                    <DescriptionListTerm>Topology</DescriptionListTerm>
+                    <DescriptionListDescription>
+                      {spec.topology}
                     </DescriptionListDescription>
                   </DescriptionListGroup>
                 )}

@@ -126,7 +126,7 @@ export default function ClustersPage() {
     try {
       const results = await clusterApi.searchAll({
         filter:
-          'resourceType == "gcphcp.fleetshift.io/Cluster" || resourceType == "kind.fleetshift.io/Cluster"',
+          'resourceType == "gcphcp.fleetshift.io/Cluster" || resourceType == "kind.fleetshift.io/Cluster" || resourceType == "assisted.fleetshift.io/Cluster"',
       });
       setRows(
         results.map((r) => ({

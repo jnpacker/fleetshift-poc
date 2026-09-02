@@ -15,6 +15,9 @@ func setupTestWebDir(t *testing.T) string {
 
 	os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>app</html>"), 0644)
 	os.WriteFile(filepath.Join(dir, "app.abc123.js"), []byte("console.log()"), 0644)
+	// silent-renew.html must keep a stable, non-content-hashed filename
+	// (it's an OIDC redirect_uri target) — see setCacheHeaders.
+	os.WriteFile(filepath.Join(dir, "silent-renew.html"), []byte("<html></html>"), 0644)
 
 	registry := pluginRegistry{
 		Plugins: map[string]pluginEntry{
@@ -55,6 +58,46 @@ func TestStaticHandler_ServesStaticFile(t *testing.T) {
 	}
 	if rec.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
 		t.Errorf("expected immutable cache for static file, got %q", rec.Header().Get("Cache-Control"))
+	}
+}
+
+func TestStaticHandler_SilentRenewHTML_NotCachedImmutably(t *testing.T) {
+	dir := setupTestWebDir(t)
+	handler := NewStaticHandler(dir)
+
+	req := httptest.NewRequest("GET", "/silent-renew.html", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	// silent-renew.html must keep a stable filename (it's an OIDC
+	// redirect_uri target) so it can never be content-hashed — it must
+	// always revalidate like index.html.
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("expected no-cache for silent-renew.html, got %q", got)
+	}
+}
+
+func TestStaticHandler_ExposedModuleChunk_NotCachedImmutably(t *testing.T) {
+	dir := setupTestWebDir(t)
+	os.WriteFile(filepath.Join(dir, "exposed-CreateAssistedWizard.js"), []byte("console.log()"), 0644)
+	handler := NewStaticHandler(dir)
+
+	req := httptest.NewRequest("GET", "/exposed-CreateAssistedWizard.js", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	// Module Federation "exposed-*.js" chunks are not content-hashed
+	// (see setCacheHeaders) -- caching them immutably means a browser
+	// that visited before a rebuild never picks up the new plugin code,
+	// since the URL never changes even though the content does.
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("expected no-cache for exposed-*.js chunk, got %q", got)
 	}
 }
 

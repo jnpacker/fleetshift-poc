@@ -404,6 +404,59 @@ const KindPlugin = new FleetshiftPlugin({
   },
 });
 
+const AssistedPlugin = new FleetshiftPlugin({
+  extensions: [
+    createClusterProvider({
+      id: "assisted",
+      label: "Assisted Service",
+      description:
+        "Provision bare-metal OpenShift clusters using the Red Hat Assisted Installer Service.",
+      keywords: [
+        "assisted",
+        "assisted service",
+        "bare metal",
+        "baremetal",
+        "openshift",
+        "installer",
+      ],
+      to: { search: "?create=assisted" },
+      icon: { $codeRef: "AssistedProviderCard.AssistedIcon" },
+      card: { $codeRef: "AssistedProviderCard.default" },
+      wizard: { $codeRef: "CreateAssistedWizard.default" },
+      searchIcon: { $codeRef: "AssistedIcon.default" },
+    }),
+    createClusterDetailTab({
+      id: "assisted-hosts",
+      label: "Hosts",
+      title: "Hosts",
+      eventKey: "hosts",
+      priority: 40,
+      service: "assisted.fleetshift.io",
+      component: { $codeRef: "HostDiscoveryTab.default" },
+    }),
+  ],
+  sharedModules,
+  entryScriptFilename: "plugins/assisted/assisted-plugin.[contenthash].js",
+  pluginManifestFilename: "plugins/assisted/assisted-plugin-manifest.json",
+  moduleFederationSettings: mfOverride,
+  pluginMetadata: {
+    name: "assisted-plugin",
+    version: "1.0.0",
+    exposedModules: {
+      AssistedProviderCard: p(
+        "./src/plugins/assisted-plugin/AssistedProviderCard.tsx",
+      ),
+      CreateAssistedWizard: p(
+        "./src/plugins/assisted-plugin/CreateAssistedWizard.tsx",
+      ),
+      AssistedIcon: p("./src/plugins/assisted-plugin/AssistedIcon.tsx"),
+      HostDiscoveryTab: p(
+        "./src/plugins/assisted-plugin/HostDiscoveryTab.tsx",
+      ),
+    },
+  },
+});
+
 const SettingsPlugin = new FleetshiftPlugin({
   extensions: [
     createModuleGroup({
@@ -596,22 +649,6 @@ const AddonDemoPlugin = new FleetshiftPlugin({
       searchIcon: { $codeRef: "EksIcon.default" },
     }),
     createClusterProvider({
-      id: "assisted-installer",
-      label: "Assisted Installer",
-      description:
-        "Create an OpenShift cluster on bare-metal or on-premise infrastructure using the Assisted Installer.",
-      keywords: ["assisted installer", "bare-metal", "on-premise", "openshift"],
-      to: { search: "?create=assisted-installer" },
-      icon: { $codeRef: "AssistedInstallerProvider.AssistedInstallerIcon" },
-      card: {
-        $codeRef: "AssistedInstallerProvider.AssistedInstallerProviderCard",
-      },
-      wizard: {
-        $codeRef: "AssistedInstallerProvider.AssistedInstallerWizard",
-      },
-      searchIcon: { $codeRef: "AssistedInstallerIcon.default" },
-    }),
-    createClusterProvider({
       id: "aro",
       label: "Azure Red Hat OpenShift",
       description:
@@ -656,20 +693,6 @@ const AddonDemoPlugin = new FleetshiftPlugin({
       icon: { $codeRef: "EksIcon.default" },
       card: { $codeRef: "EksOnboarding.EksOnboardingCard" },
       form: { $codeRef: "EksOnboarding.EksOnboardingForm" },
-      category: "fleetshift.cluster-provider",
-    }),
-    createOnboardingAction({
-      id: "assisted-installer-connect",
-      label: "Assisted Installer",
-      description:
-        "Link your infrastructure to deploy and manage bare-metal OpenShift clusters.",
-      icon: { $codeRef: "AssistedInstallerIcon.default" },
-      card: {
-        $codeRef: "AssistedInstallerOnboarding.AssistedInstallerOnboardingCard",
-      },
-      form: {
-        $codeRef: "AssistedInstallerOnboarding.AssistedInstallerOnboardingForm",
-      },
       category: "fleetshift.cluster-provider",
     }),
     createOnboardingAction({
@@ -801,9 +824,6 @@ const AddonDemoPlugin = new FleetshiftPlugin({
       EksProvider: p(
         "./src/plugins/addon-demo-plugin/providers/EksProvider.tsx",
       ),
-      AssistedInstallerProvider: p(
-        "./src/plugins/addon-demo-plugin/providers/AssistedInstallerProvider.tsx",
-      ),
       AroProvider: p(
         "./src/plugins/addon-demo-plugin/providers/AroProvider.tsx",
       ),
@@ -815,18 +835,12 @@ const AddonDemoPlugin = new FleetshiftPlugin({
       ),
       // Provider icons
       EksIcon: p("./src/plugins/addon-demo-plugin/icons/EksIcon.tsx"),
-      AssistedInstallerIcon: p(
-        "./src/plugins/addon-demo-plugin/icons/AssistedInstallerIcon.tsx",
-      ),
       AroIcon: p("./src/plugins/addon-demo-plugin/icons/AroIcon.tsx"),
       RosaIcon: p("./src/plugins/addon-demo-plugin/icons/RosaIcon.tsx"),
       VsphereIcon: p("./src/plugins/addon-demo-plugin/icons/VsphereIcon.tsx"),
       // Provider onboarding
       EksOnboarding: p(
         "./src/plugins/addon-demo-plugin/providers/EksOnboarding.tsx",
-      ),
-      AssistedInstallerOnboarding: p(
-        "./src/plugins/addon-demo-plugin/providers/AssistedInstallerOnboarding.tsx",
       ),
       AroOnboarding: p(
         "./src/plugins/addon-demo-plugin/providers/AroOnboarding.tsx",
@@ -890,6 +904,7 @@ const pluginConfigs = [
   { plugin: RoutingPlugin, key: "routing" },
   { plugin: GcpHcpPlugin, key: "gcphcp" },
   { plugin: KindPlugin, key: "kind" },
+  { plugin: AssistedPlugin, key: "assisted" },
   { plugin: SetupPlugin, key: "setup" },
   { plugin: ConfigurationPlugin, key: "configuration" },
   { plugin: VirtualizationPlugin, key: "virtualization" },

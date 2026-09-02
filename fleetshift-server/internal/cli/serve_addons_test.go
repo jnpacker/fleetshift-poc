@@ -9,8 +9,8 @@ import (
 
 func TestDefaultAddons(t *testing.T) {
 	t.Setenv("FLEETSHIFT_SERVER_ADDONS", "")
-	if got := defaultAddons(); got != "kind,kubernetes" {
-		t.Fatalf("defaultAddons() = %q, want kind,kubernetes", got)
+	if got := defaultAddons(); got != "kind,kubernetes,assisted" {
+		t.Fatalf("defaultAddons() = %q, want kind,kubernetes,assisted", got)
 	}
 
 	t.Setenv("FLEETSHIFT_SERVER_ADDONS", "kubernetes,gcphcp")

@@ -17,6 +17,27 @@ echo "::1 keycloak" | sudo tee -a /etc/hosts
 echo "127.0.0.1 keycloak" | sudo tee -a /etc/hosts
 ```
 
+**Windows (WSL2):** WSL and Windows have separate `/etc/hosts` files and separate certificate trust stores — both need a one-time fix, since the browser runs on Windows but Podman runs inside the WSL VM.
+
+1. WSL's own hosts file (needed for `task podman:up`'s host-side Keycloak readiness check):
+   ```bash
+   echo "127.0.0.1 keycloak" | sudo tee -a /etc/hosts
+   ```
+2. Windows' hosts file (`C:\Windows\System32\drivers\etc\hosts`, requires admin) — use **`::1`** (IPv6 loopback), not `127.0.0.1`. WSL2's localhost port-forwarding for Keycloak's port only proxies reliably over IPv6 here:
+   ```
+   ::1 keycloak
+   ```
+   No admin rights? Launch the browser with a per-process DNS override instead (no hosts file edit needed):
+   ```powershell
+   Get-Process msedge | Stop-Process -Force
+   & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --host-resolver-rules="MAP keycloak ::1" --user-data-dir="C:\temp\edge-fleetshift-dev"
+   ```
+3. Trust the mkcert CA in Windows too — `mkcert -install` only trusts it inside WSL's own store:
+   ```powershell
+   Import-Certificate -FilePath "\\wsl.localhost\<distro>\<path-to-repo>\deploy\podman\.certs\ca.crt" -CertStoreLocation Cert:\CurrentUser\Root
+   ```
+   (No admin needed for `CurrentUser`; use `Cert:\LocalMachine\Root` instead if you have admin rights.)
+
 ## Quick Start
 
 ```bash
@@ -75,7 +96,7 @@ podman run --rm -p 8085:8085 -p 50051:50051 \
   quay.io/stolostron/fleetshift:latest
 ```
 
-With kind provisioning (same privileges/socket pattern as compose). This path is a trusted local/dev tool: privileged + host container socket means full control of the host engine. With no GCP HCP variables, the image starts with `kind,kubernetes`. Supply only `-e GCPHCP_GATEWAY_URL=...` to activate `gcphcp` with the shared renderer defaults.
+With kind provisioning (same privileges/socket pattern as compose). This path is a trusted local/dev tool: privileged + host container socket means full control of the host engine. With no GCP HCP variables, the image starts with `kind,kubernetes,assisted`. Supply only `-e GCPHCP_GATEWAY_URL=...` to activate `gcphcp` with the shared renderer defaults.
 
 ```bash
 podman run --rm \
@@ -160,7 +181,7 @@ Copy `.env.template` to `.env` and edit. All available settings are documented i
 
 ### `gcphcp` Addon Toggle
 
-- Default: `kind,kubernetes`
+- Default: `kind,kubernetes,assisted`
 - Add `gcphcp`: set `GCPHCP_ENABLED=true` and `GCPHCP_GATEWAY_URL` in `.env`
   (`AUTH=external` required). Optional `GCPHCP_*` overrides use renderer
   defaults when empty.

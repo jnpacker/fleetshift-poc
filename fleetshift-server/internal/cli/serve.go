@@ -34,6 +34,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/fleetshift/fleetshift-poc/fleetshift-server/gen/fleetshift/v1"
+	assistedaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/assisted"
 	gcphcpaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/gcphcp"
 	kindaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/kind"
 	kubernetesaddon "github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/addon/kubernetes"
@@ -69,6 +70,9 @@ type serveFlags struct {
 	oidcUIClientID   string
 	addons           string
 	gcphcpConfig     string
+	redHatSSOIssuer  string
+	redHatSSOClient  string
+	assistedSvcURL   string
 }
 
 func newServeCmd() *cobra.Command {
@@ -92,8 +96,11 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&f.webDir, "web-dir", "", "directory containing frontend assets to serve (empty = API only)")
 	cmd.Flags().StringVar(&f.oidcUIAuthority, "oidc-ui-authority", os.Getenv("OIDC_ISSUER_URL"), "OIDC authority URL for the frontend UI")
 	cmd.Flags().StringVar(&f.oidcUIClientID, "oidc-ui-client-id", envOrDefault("OIDC_UI_CLIENT_ID", "fleetshift-ui"), "OIDC client ID for the frontend UI")
-	cmd.Flags().StringVar(&f.addons, "addons", defaultAddons(), "comma-separated list of addons to enable (default: kind,kubernetes; override with FLEETSHIFT_SERVER_ADDONS)")
+	cmd.Flags().StringVar(&f.addons, "addons", defaultAddons(), "comma-separated list of addons to enable (default: kind,kubernetes,assisted; override with FLEETSHIFT_SERVER_ADDONS)")
 	cmd.Flags().StringVar(&f.gcphcpConfig, "gcphcp-config", "", "path to gcphcp addon config file (or GCPHCP_CONFIG env)")
+	cmd.Flags().StringVar(&f.redHatSSOIssuer, "redhat-sso-issuer", envOrDefault("REDHAT_SSO_ISSUER", "https://sso.redhat.com/auth/realms/redhat-external"), "Red Hat SSO OIDC issuer for the assisted-plugin device login")
+	cmd.Flags().StringVar(&f.redHatSSOClient, "redhat-sso-client-id", envOrDefault("REDHAT_SSO_CLIENT_ID", "ocm-cli"), "OAuth2 client ID for the Red Hat SSO device login")
+	cmd.Flags().StringVar(&f.assistedSvcURL, "assisted-service-url", envOrDefault("ASSISTED_SERVICE_URL", "https://api.openshift.com"), "base URL for the Assisted Service / OCM accounts management APIs")
 	return cmd
 }
 
@@ -283,6 +290,11 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		}
 		gcphcpConcreteAgent = gcphcpaddon.NewAgent(deps)
 		gcphcpAgent = gcphcpConcreteAgent
+	}
+
+	var assistedAgent domain.DeliveryAgent
+	if enabledAddons["assisted"] {
+		assistedAgent = assistedaddon.NewAgent(deliveryReporter)
 	}
 
 	orchSpec := domain.NewOrchestrationWorkflowSpec(
@@ -581,6 +593,16 @@ func runServe(ctx context.Context, f *serveFlags) error {
 		Store:         store,
 		ProvenanceSvc: provenanceSvc,
 	})
+	assistedOCM := transporthttp.NewAssistedOCMHandler(f.redHatSSOIssuer, f.redHatSSOClient, f.assistedSvcURL, logger.With("component", "assisted-ocm"))
+	topMux.Handle("POST /api/ui/assisted/auth/device", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleStartDeviceAuth)))
+	topMux.Handle("GET /api/ui/assisted/auth/device/poll/{sessionId}", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandlePollDeviceAuth)))
+	topMux.Handle("GET /api/ui/assisted/account/{sessionId}", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleAccount)))
+	topMux.Handle("GET /api/ui/assisted/openshift-versions/{sessionId}", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleOpenShiftVersions)))
+	topMux.Handle("POST /api/ui/assisted/clusters/{sessionId}", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleCreateCluster)))
+	topMux.Handle("GET /api/ui/assisted/clusters/{sessionId}/{clusterId}", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleGetCluster)))
+	topMux.Handle("POST /api/ui/assisted/infra-envs/{sessionId}", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleCreateInfraEnv)))
+	topMux.Handle("GET /api/ui/assisted/infra-envs/{sessionId}/{infraEnvId}/image-url", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleGetImageURL)))
+	topMux.Handle("GET /api/ui/assisted/infra-envs/{sessionId}/{infraEnvId}/hosts", httpAuthn.Wrap(http.HandlerFunc(assistedOCM.HandleListHosts)))
 	dynamicHTTPConn, err := grpc.NewClient(f.grpcAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return fmt.Errorf("dynamic http mux grpc client: %w", err)
@@ -657,6 +679,11 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			return fmt.Errorf("enable gcphcp addon: %w", err)
 		}
 	}
+	if enabledAddons["assisted"] {
+		if err := addonMgr.Enable(ctx, assistedaddon.Descriptor()); err != nil {
+			return fmt.Errorf("enable assisted addon: %w", err)
+		}
+	}
 
 	// --- start ---
 
@@ -726,6 +753,24 @@ func runServe(ctx context.Context, f *serveFlags) error {
 			if err := gcphcpConcreteAgent.RecoverActiveDeliveries(ctx, []domain.TargetID{targetID}); err != nil {
 				logger.Error("gcphcp: failed to recover active deliveries", "error", err)
 			}
+		}
+	}
+
+	if enabledAddons["assisted"] {
+		if err := addonMgr.Connect(ctx, assistedaddon.Descriptor().ID, application.ConnectInput{
+			Agent: assistedAgent,
+			Targets: []domain.TargetInfo{domain.NewTargetInfo(
+				assistedaddon.AddonTargetID,
+				assistedaddon.TargetType,
+				"Assisted Installer Service",
+				domain.TargetStateReady,
+				nil,
+				nil,
+				[]domain.ManifestType{assistedaddon.ClusterManifestType},
+			)},
+			Schemas: []domain.ExtensionResourceSchema{assistedaddon.Schema()},
+		}); err != nil {
+			return fmt.Errorf("connect assisted addon: %w", err)
 		}
 	}
 
@@ -856,7 +901,7 @@ func envOrDefault(key, fallback string) string {
 // defaultAddons returns the serve --addons default. An explicit --addons flag
 // remains authoritative over FLEETSHIFT_SERVER_ADDONS.
 func defaultAddons() string {
-	return envOrDefault("FLEETSHIFT_SERVER_ADDONS", "kind,kubernetes")
+	return envOrDefault("FLEETSHIFT_SERVER_ADDONS", "kind,kubernetes,assisted")
 }
 
 func resolveGCPHCPConfigPath(flagPath string) string {

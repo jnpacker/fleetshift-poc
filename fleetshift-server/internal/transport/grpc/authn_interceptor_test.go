@@ -102,6 +102,18 @@ func (s *authCaptureServer) ListDeployments(ctx context.Context, _ *pb.ListDeplo
 	return &pb.ListDeploymentsResponse{}, nil
 }
 
+// authCaptureAuthMethodServer captures the AuthorizationContext from
+// CreateAuthMethod, to test the alwaysAnonymousMethods exemption.
+type authCaptureAuthMethodServer struct {
+	pb.UnimplementedAuthMethodServiceServer
+	authCtx *application.AuthorizationContext
+}
+
+func (s *authCaptureAuthMethodServer) CreateAuthMethod(ctx context.Context, _ *pb.CreateAuthMethodRequest) (*pb.AuthMethod, error) {
+	s.authCtx = application.AuthFromContext(ctx)
+	return &pb.AuthMethod{}, nil
+}
+
 func setupAuthnTest(t *testing.T, repo *fakeAuthMethodRepo, verifier *fakeOIDCTokenVerifier) (pb.DeploymentServiceClient, *authCaptureServer) {
 	t.Helper()
 
@@ -134,6 +146,43 @@ func setupAuthnTest(t *testing.T, repo *fakeAuthMethodRepo, verifier *fakeOIDCTo
 	t.Cleanup(func() { conn.Close() })
 
 	return pb.NewDeploymentServiceClient(conn), capture
+}
+
+// setupAuthMethodAuthnTest is like setupAuthnTest but registers
+// AuthMethodService instead of DeploymentService, so tests can exercise the
+// alwaysAnonymousMethods exemption for CreateAuthMethod.
+func setupAuthMethodAuthnTest(t *testing.T, repo *fakeAuthMethodRepo, verifier *fakeOIDCTokenVerifier) (pb.AuthMethodServiceClient, *authCaptureAuthMethodServer) {
+	t.Helper()
+
+	authMethodSvc := &application.AuthMethodService{
+		Methods: repo,
+	}
+
+	interceptor := NewAuthnInterceptor(authMethodSvc, verifier, domain.NoOpAuthnObserver{})
+	interceptor.cacheTTL = 0 // disable cache for tests
+
+	capture := &authCaptureAuthMethodServer{}
+	lis := bufconn.Listen(1 << 20)
+	srv := grpclib.NewServer(
+		grpclib.UnaryInterceptor(interceptor.Unary()),
+	)
+	pb.RegisterAuthMethodServiceServer(srv, capture)
+
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.GracefulStop)
+
+	conn, err := grpclib.NewClient("passthrough:///bufconn",
+		grpclib.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpclib.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("dial bufconn: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	return pb.NewAuthMethodServiceClient(conn), capture
 }
 
 func TestAuthnInterceptor_NoAuthMethods_Anonymous(t *testing.T) {
@@ -266,6 +315,45 @@ func TestAuthnInterceptor_NoToken_WithMethodsConfigured(t *testing.T) {
 	}
 	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unauthenticated {
 		t.Errorf("code = %v, want Unauthenticated", status.Code(err))
+	}
+}
+
+func TestAuthnInterceptor_CreateAuthMethod_AnonymousEvenWhenConfigured(t *testing.T) {
+	repo := newFakeAuthMethodRepo()
+	ctx := context.Background()
+	if err := repo.Save(ctx, domain.AuthMethodFromSnapshot(domain.AuthMethodSnapshot{
+		ID:   "default",
+		Type: domain.AuthMethodTypeOIDC,
+		OIDC: &domain.OIDCConfig{
+			IssuerURL: "https://issuer.example.com",
+			Audience:  "test-audience",
+			JWKSURI:   "https://issuer.example.com/jwks",
+
+			AuthorizationEndpoint: "https://issuer.example.com/authorize",
+			TokenEndpoint:         "https://issuer.example.com/token",
+		},
+	})); err != nil {
+		t.Fatalf("Save auth method: %v", err)
+	}
+
+	verifier := &fakeOIDCTokenVerifier{acceptToken: "valid-token"}
+	client, capture := setupAuthMethodAuthnTest(t, repo, verifier)
+
+	// No authorization header, and an auth method is already configured —
+	// CreateAuthMethod should still be allowed through anonymously so
+	// idempotent bootstrap/setup tooling can safely re-run.
+	_, err := client.CreateAuthMethod(ctx, &pb.CreateAuthMethodRequest{
+		AuthMethodId: "default",
+		AuthMethod:   &pb.AuthMethod{Type: pb.AuthMethod_TYPE_OIDC},
+	})
+	if err != nil {
+		t.Fatalf("CreateAuthMethod: %v", err)
+	}
+	if capture.authCtx == nil {
+		t.Fatal("AuthorizationContext is nil")
+	}
+	if capture.authCtx.Subject != nil {
+		t.Errorf("Subject = %v, want nil (anonymous)", capture.authCtx.Subject)
 	}
 }
 

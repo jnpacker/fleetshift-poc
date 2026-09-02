@@ -4,6 +4,17 @@
   "workspaces": [
     "packages/*"
   ],
+  "overrides": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@rspack/core": "2.0.8",
+    "uuid": "^11.1.1",
+    "undici": "^7.28.0",
+    "form-data": "^4.0.6",
+    "dompurify": "^3.4.11"
+  },
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:watch": "node scripts/dev.mjs --watch",
@@ -23,7 +34,7 @@
     "**/*.{css,scss}": "stylelint --fix"
   },
   "devDependencies": {
-    "@module-federation/enhanced": "2.8.1",
+    "@module-federation/enhanced": "2.5.1",
     "@playwright/experimental-ct-react": "^1.61.1",
     "@playwright/test": "^1.61.1",
     "@typescript-eslint/eslint-plugin": "^8.56.1",

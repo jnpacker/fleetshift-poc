@@ -62,12 +62,12 @@ fi
 enabled_raw="${GCPHCP_ENABLED-}"
 
 if [ -n "$enabled_raw" ] && is_falsey "$enabled_raw"; then
-  ensure_addons "kind,kubernetes"
+  ensure_addons "kind,kubernetes,assisted"
   exec fleetshift "$@"
 fi
 
 if [ -n "${GCPHCP_CONFIG:-}" ]; then
-  ensure_addons "kind,kubernetes,gcphcp"
+  ensure_addons "kind,kubernetes,gcphcp,assisted"
   exec fleetshift "$@"
 fi
 
@@ -75,7 +75,7 @@ if [ -n "${GCPHCP_GATEWAY_URL:-}" ]; then
   export GCPHCP_ENABLED=true
   "$RENDERER" --output "$CONFIG_OUT"
   export GCPHCP_CONFIG="$CONFIG_OUT"
-  ensure_addons "kind,kubernetes,gcphcp"
+  ensure_addons "kind,kubernetes,gcphcp,assisted"
   exec fleetshift "$@"
 fi
 
@@ -91,5 +91,5 @@ EOF
   exit 1
 fi
 
-ensure_addons "kind,kubernetes"
+ensure_addons "kind,kubernetes,assisted"
 exec fleetshift "$@"

@@ -16,6 +16,19 @@ import (
 	"github.com/fleetshift/fleetshift-poc/fleetshift-server/internal/domain"
 )
 
+// alwaysAnonymousMethods lists full gRPC method names that are allowed to
+// proceed anonymously even after auth methods have been configured.
+//
+// CreateAuthMethod is idempotent (it upserts by auth method ID), so it is
+// safe to let bootstrap/setup tooling — e.g. `fleetctl auth setup` in the
+// podman and Kubernetes deployments — call it without credentials even when
+// re-run against a server that already has an auth method configured. This
+// keeps setup scripts simple: they don't need to detect "already configured"
+// or acquire a token before performing initial OIDC provisioning.
+var alwaysAnonymousMethods = map[string]bool{
+	"/fleetshift.v1.AuthMethodService/CreateAuthMethod": true,
+}
+
 // AuthnInterceptor extracts credentials from incoming requests, validates
 // them against configured authentication methods, and attaches an
 // [application.AuthorizationContext] to the request context.
@@ -130,7 +143,7 @@ func (a *AuthnInterceptor) authenticate(ctx context.Context, fullMethod string) 
 
 	if subject != nil {
 		probe.Authenticated(matchedType, *subject)
-	} else if len(methods) > 0 {
+	} else if len(methods) > 0 && !alwaysAnonymousMethods[fullMethod] {
 		probe.Anonymous()
 		return ctx, status.Errorf(codes.Unauthenticated, "unauthenticated")
 	} else {
